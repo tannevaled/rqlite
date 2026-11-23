@@ -65,6 +65,14 @@ type ConnConfig struct {
 
 	// QueryLogger, if non-nil, installs query tracing on every new connection.
 	QueryLogger *querylog.QueryLogger
+
+	// ExclusiveWAL, if true, puts every new connection in exclusive locking
+	// mode and then in WAL mode, in that order. It is for a VFS without
+	// shared memory (see the walframe package), where WAL only works with
+	// exclusive locking and one connection. It is done here, after the
+	// connection is open, because the driver sorts the DSN's _pragma values
+	// and would run journal_mode first, where it is silently refused.
+	ExclusiveWAL bool
 }
 
 // connector returns a database/sql connector which opens connections to the
@@ -149,6 +157,27 @@ func buildConnectHook(cfg *ConnConfig) sqlite.ConnectionHookFn {
 		// statements. DETACH then fails on its own, as nothing is attached.
 		if cfg.DisableAttach {
 			raw.setLimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+		}
+
+		if cfg.ExclusiveWAL {
+			for _, p := range []string{"PRAGMA locking_mode=EXCLUSIVE", "PRAGMA synchronous=OFF", "PRAGMA temp_store=MEMORY"} {
+				if _, err := conn.ExecContext(ctx, p, nil); err != nil {
+					return fmt.Errorf("%s: %w", p, err)
+				}
+			}
+			rows, err := conn.QueryContext(ctx, "PRAGMA journal_mode=WAL", nil)
+			if err != nil {
+				return fmt.Errorf("cannot enable WAL: %w", err)
+			}
+			dest := make([]driver.Value, 1)
+			err = rows.Next(dest)
+			rows.Close()
+			if err != nil {
+				return fmt.Errorf("cannot read journal mode: %w", err)
+			}
+			if m, _ := dest[0].(string); m != "wal" {
+				return fmt.Errorf("journal_mode is %v, want wal", dest[0])
+			}
 		}
 
 		// Foreign key constraints.
