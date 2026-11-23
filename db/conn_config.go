@@ -119,6 +119,30 @@ func (c *connector) Driver() driver.Driver {
 	return c.drv
 }
 
+// setExclusiveWAL puts the connection in exclusive locking and WAL mode, and
+// verifies SQLite really is in WAL mode.
+func setExclusiveWAL(ctx context.Context, conn sqlite.ExecQuerierContext) error {
+	for _, p := range []string{"PRAGMA locking_mode=EXCLUSIVE", "PRAGMA synchronous=OFF", "PRAGMA temp_store=MEMORY"} {
+		if _, err := conn.ExecContext(ctx, p, nil); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	rows, err := conn.QueryContext(ctx, "PRAGMA journal_mode=WAL", nil)
+	if err != nil {
+		return fmt.Errorf("cannot enable WAL: %w", err)
+	}
+	dest := make([]driver.Value, 1)
+	err = rows.Next(dest)
+	rows.Close()
+	if err != nil {
+		return fmt.Errorf("cannot read journal mode: %w", err)
+	}
+	if m, _ := dest[0].(string); m != "wal" {
+		return fmt.Errorf("journal_mode is %v, want wal", dest[0])
+	}
+	return nil
+}
+
 // buildConnectHook composes a connection hook from cfg, chaining all requested
 // connection-level behaviors in order: checkpoint config, attach limit,
 // foreign keys, query tracing, then hooks.
@@ -164,23 +188,8 @@ func buildConnectHook(cfg *ConnConfig) sqlite.ConnectionHookFn {
 		}
 
 		if cfg.ExclusiveWAL {
-			for _, p := range []string{"PRAGMA locking_mode=EXCLUSIVE", "PRAGMA synchronous=OFF", "PRAGMA temp_store=MEMORY"} {
-				if _, err := conn.ExecContext(ctx, p, nil); err != nil {
-					return fmt.Errorf("%s: %w", p, err)
-				}
-			}
-			rows, err := conn.QueryContext(ctx, "PRAGMA journal_mode=WAL", nil)
-			if err != nil {
-				return fmt.Errorf("cannot enable WAL: %w", err)
-			}
-			dest := make([]driver.Value, 1)
-			err = rows.Next(dest)
-			rows.Close()
-			if err != nil {
-				return fmt.Errorf("cannot read journal mode: %w", err)
-			}
-			if m, _ := dest[0].(string); m != "wal" {
-				return fmt.Errorf("journal_mode is %v, want wal", dest[0])
+			if err := setExclusiveWAL(ctx, conn); err != nil {
+				return err
 			}
 		}
 

@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"database/sql/driver"
+	"errors"
 	"io"
 	"log"
 	"path/filepath"
@@ -35,6 +37,79 @@ func TestGuardDenies(t *testing.T) {
 		if got := guardDenies(c.op, c.z1); got != c.deny {
 			t.Errorf("guardDenies(%d, %q) = %v", c.op, c.z1, got)
 		}
+	}
+}
+
+// A connection with no guard registered is never refused.
+func TestGuardCallbackWithoutAGuard(t *testing.T) {
+	var got int32 = -1
+	func() {
+		defer func() { recover() }()
+		got = guardCallback(nil, 0xdead, sqlite3.SQLITE_DETACH, 0, 0, 0, 0)
+	}()
+	if got != sqlite3.SQLITE_OK {
+		t.Errorf("unregistered connection: verdict %d", got)
+	}
+}
+
+type fakeConn struct {
+	execFail  int // fail the Nth ExecContext (1-based)
+	execs     int
+	queryErr  error
+	rows      driver.Rows
+	queriedBy string
+}
+
+func (f *fakeConn) ExecContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Result, error) {
+	f.execs++
+	if f.execs == f.execFail {
+		return nil, errors.New("exec refused")
+	}
+	return nil, nil
+}
+
+func (f *fakeConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
+	f.queriedBy = q
+	return f.rows, f.queryErr
+}
+
+type fakeRows struct {
+	val driver.Value
+	err error
+}
+
+func (r *fakeRows) Columns() []string { return []string{"journal_mode"} }
+func (r *fakeRows) Close() error      { return nil }
+func (r *fakeRows) Next(dest []driver.Value) error {
+	if r.err != nil {
+		return r.err
+	}
+	dest[0] = r.val
+	return nil
+}
+
+func TestSetExclusiveWAL(t *testing.T) {
+	ctx := context.Background()
+	if err := setExclusiveWAL(ctx, &fakeConn{rows: &fakeRows{val: "wal"}}); err != nil {
+		t.Errorf("wal: %v", err)
+	}
+	for n := 1; n <= 3; n++ {
+		err := setExclusiveWAL(ctx, &fakeConn{execFail: n, rows: &fakeRows{val: "wal"}})
+		if err == nil || !strings.Contains(err.Error(), "exec refused") || !strings.HasPrefix(err.Error(), "PRAGMA ") {
+			t.Errorf("pragma %d failing: %v", n, err)
+		}
+	}
+	if err := setExclusiveWAL(ctx, &fakeConn{queryErr: errors.New("q")}); err == nil || !strings.Contains(err.Error(), "cannot enable WAL") {
+		t.Errorf("query failing: %v", err)
+	}
+	if err := setExclusiveWAL(ctx, &fakeConn{rows: &fakeRows{err: errors.New("r")}}); err == nil || !strings.Contains(err.Error(), "cannot read journal mode") {
+		t.Errorf("row failing: %v", err)
+	}
+	if err := setExclusiveWAL(ctx, &fakeConn{rows: &fakeRows{val: "delete"}}); err == nil || !strings.Contains(err.Error(), "want wal") {
+		t.Errorf("delete mode: %v", err)
+	}
+	if err := setExclusiveWAL(ctx, &fakeConn{rows: &fakeRows{val: []byte("wal")}}); err == nil {
+		t.Error("a non-string mode was accepted")
 	}
 }
 
