@@ -10,7 +10,13 @@ import (
 // because a mutant here panics in every later engine test's cleanup, and the
 // assertion must be the first failure seen.
 func TestCloseLockedWithoutAConnection(t *testing.T) {
-	e := testEngine(t, 1<<30)
+	// Built by hand: a cleanup that closed the engine would panic under the
+	// mutant and bury the assertion below in the panic's output.
+	e, err := newEngine(t.TempDir(), 1<<30, nil, osOps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.fsys.Close()
 	func() {
 		defer func() { recover() }()
 		e.closeLocked()
@@ -18,7 +24,6 @@ func TestCloseLockedWithoutAConnection(t *testing.T) {
 	if e.v.fenced.Load() {
 		t.Error("closing nothing fenced the storage")
 	}
-	e.v.fenced.Store(false)
 }
 
 // An unwritable parent makes MkdirAll fail where no file removal does.
