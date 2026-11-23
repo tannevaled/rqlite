@@ -457,12 +457,12 @@ func TestMarshalPageListRefusals(t *testing.T) {
 	defer nopanic(t)
 	pg := filled(512, 1)
 	cases := map[string]*PageList{
-		"page size":    {PageSize: 100},
-		"short pgnos":  {PageSize: 512, Txs: []Tx{{Pgnos: nil, Pages: [][]byte{pg}, DBSize: 1}}},
-		"short pages":  {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: nil, DBSize: 1}}},
-		"empty tx":     {PageSize: 512, Txs: []Tx{{DBSize: 1}}},
-		"short page":   {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{pg[:511]}, DBSize: 1}}},
-		"long page":    {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{append(pg[:512:512], 0)}, DBSize: 1}}},
+		"page size":     {PageSize: 100},
+		"short pgnos":   {PageSize: 512, Txs: []Tx{{Pgnos: nil, Pages: [][]byte{pg}, DBSize: 1}}},
+		"short pages":   {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: nil, DBSize: 1}}},
+		"empty tx":      {PageSize: 512, Txs: []Tx{{DBSize: 1}}},
+		"short page":    {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{pg[:511]}, DBSize: 1}}},
+		"long page":     {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{append(pg[:512:512], 0)}, DBSize: 1}}},
 		"second tx bad": {PageSize: 512, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{pg}, DBSize: 1}, {DBSize: 1}}},
 	}
 	for name, pl := range cases {

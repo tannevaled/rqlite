@@ -24,11 +24,16 @@
 //
 // # Refused in this mode
 //
-// ATTACH; PRAGMA journal_mode, wal_checkpoint, wal_autocheckpoint,
-// locking_mode, page_size, auto_vacuum, synchronous, writable_schema,
-// temp_store, mmap_size; a transaction left open across requests. These are
-// matched by a regexp, which comments or odd spacing may evade: an authorizer
-// hook would be the real gate. Node-local page writers (auto-VACUUM,
+// ATTACH, DETACH; the PRAGMAs listed in db.guardedPragmas (journal_mode,
+// wal_checkpoint, wal_autocheckpoint, locking_mode, page_size, auto_vacuum,
+// synchronous, writable_schema, temp_store, mmap_size and others); a
+// transaction left open across requests. The first two groups are refused by a
+// SQLite authorizer (db.Guard) at prepare time, so comments, spacing, case and
+// multi-statement strings cannot get past it. One hole is known: VACUUM
+// attaches a private database with an empty file name, which must be allowed,
+// so ATTACH '' AS x is allowed too; it is an empty, per-connection database
+// that is not replicated, and statements that use it would diverge. Node-local
+// page writers (auto-VACUUM,
 // auto-optimize) are refused or absent; user-issued VACUUM, ANALYZE and PRAGMA
 // optimize go through Execute and are replicated as pages (VACUUM ships
 // roughly the whole database).
