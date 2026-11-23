@@ -40,29 +40,35 @@ func MarshalPageList(pl *PageList) ([]byte, error) {
 	if !validPageSize(pl.PageSize) {
 		return nil, fmt.Errorf("%w: page size %d", ErrBadPageList, pl.PageSize)
 	}
-	n := 12
-	for _, tx := range pl.Txs {
-		n += 8 + len(tx.Pgnos)*(4+int(pl.PageSize))
-	}
-	b := make([]byte, 0, n)
-	b = append(b, pageListMagic...)
-	b = binary.BigEndian.AppendUint32(b, pl.PageSize)
-	b = binary.BigEndian.AppendUint32(b, uint32(len(pl.Txs)))
 	for _, tx := range pl.Txs {
 		if len(tx.Pgnos) != len(tx.Pages) || len(tx.Pgnos) == 0 {
 			return nil, fmt.Errorf("%w: transaction with %d page numbers and %d pages", ErrBadPageList, len(tx.Pgnos), len(tx.Pages))
 		}
-		b = binary.BigEndian.AppendUint32(b, tx.DBSize)
-		b = binary.BigEndian.AppendUint32(b, uint32(len(tx.Pgnos)))
-		for i, pg := range tx.Pages {
+		for _, pg := range tx.Pages {
 			if len(pg) != int(pl.PageSize) {
 				return nil, fmt.Errorf("%w: page of %d bytes", ErrBadPageList, len(pg))
 			}
+		}
+	}
+	return encodePageList(pl), nil
+}
+
+// encodePageList is MarshalPageList for a list the caller built itself (the
+// engine's, from frames it just scanned): no validation.
+func encodePageList(pl *PageList) []byte {
+	var b []byte
+	b = append(b, pageListMagic...)
+	b = binary.BigEndian.AppendUint32(b, pl.PageSize)
+	b = binary.BigEndian.AppendUint32(b, uint32(len(pl.Txs)))
+	for _, tx := range pl.Txs {
+		b = binary.BigEndian.AppendUint32(b, tx.DBSize)
+		b = binary.BigEndian.AppendUint32(b, uint32(len(tx.Pgnos)))
+		for i, pg := range tx.Pages {
 			b = binary.BigEndian.AppendUint32(b, tx.Pgnos[i])
 			b = append(b, pg...)
 		}
 	}
-	return b, nil
+	return b
 }
 
 // UnmarshalPageList decodes b. It never allocates more than len(b) bytes for
@@ -79,10 +85,7 @@ func UnmarshalPageList(b []byte) (*PageList, error) {
 	}
 	nTx := binary.BigEndian.Uint32(b[8:])
 	b = b[12:]
-	if uint64(nTx)*(8+4+uint64(ps)) > uint64(len(b)) {
-		return bad("transaction count")
-	}
-	pl := &PageList{PageSize: ps, Txs: make([]Tx, 0, nTx)}
+	pl := &PageList{PageSize: ps} // grows only as transactions are read in full
 	for i := uint32(0); i < nTx; i++ {
 		if len(b) < 8 {
 			return bad("truncated transaction")
@@ -114,15 +117,9 @@ func UnmarshalPageList(b []byte) (*PageList, error) {
 // command is a Raft log entry: a type byte, the 16-byte ID the Leader gave
 // the request (so the Leader's own FSM recognises its entry and does not
 // apply it a second time), and a PageList.
-func marshalCommand(id [idSize]byte, pl *PageList) ([]byte, error) {
-	p, err := MarshalPageList(pl)
-	if err != nil {
-		return nil, err
-	}
-	b := make([]byte, 0, 1+idSize+len(p))
-	b = append(b, cmdPages)
-	b = append(b, id[:]...)
-	return append(b, p...), nil
+func marshalCommand(id [idSize]byte, pl *PageList) []byte {
+	b := append([]byte{cmdPages}, id[:]...)
+	return append(b, encodePageList(pl)...)
 }
 
 func unmarshalCommand(b []byte) (id [idSize]byte, pl *PageList, err error) {

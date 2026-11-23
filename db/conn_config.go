@@ -73,6 +73,10 @@ type ConnConfig struct {
 	// connection is open, because the driver sorts the DSN's _pragma values
 	// and would run journal_mode first, where it is silently refused.
 	ExclusiveWAL bool
+
+	// Guard, if non-nil, installs its authorizer on every new connection,
+	// after the connection's own setup. It is off until the owner turns it on.
+	Guard *Guard
 }
 
 // connector returns a database/sql connector which opens connections to the
@@ -178,6 +182,10 @@ func buildConnectHook(cfg *ConnConfig) sqlite.ConnectionHookFn {
 			if m, _ := dest[0].(string); m != "wal" {
 				return fmt.Errorf("journal_mode is %v, want wal", dest[0])
 			}
+		}
+
+		if cfg.Guard != nil {
+			raw.installGuard(cfg.Guard)
 		}
 
 		// Foreign key constraints.

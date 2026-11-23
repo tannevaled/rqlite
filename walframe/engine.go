@@ -10,9 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sync"
-	"time"
 
 	command "github.com/rqlite/rqlite/v10/command/proto"
 	"github.com/rqlite/rqlite/v10/db"
@@ -21,17 +19,12 @@ import (
 
 // Errors returned by the engine.
 var (
-	// ErrRefused is returned for a statement this mode cannot replicate.
-	ErrRefused = errors.New("walframe: statement refused in WAL-frame replication mode")
 	// ErrTxAcrossRequests is returned when a request leaves a transaction open.
 	ErrTxAcrossRequests = errors.New("walframe: a transaction cannot span requests")
 )
 
-// refused matches the statements that write pages or change file-level
-// settings outside the replicated WAL, which would make the nodes diverge or
-// break the single exclusive connection (see doc.go). A text match is a
-// prototype shortcut: it can be bypassed, an authorizer hook cannot.
-var refused = regexp.MustCompile(`(?is)^\s*(attach\b|pragma\s+([a-z_]+\.)?(journal_mode|wal_checkpoint|wal_autocheckpoint|locking_mode|page_size|auto_vacuum|synchronous|writable_schema|temp_store|mmap_size)\b)`)
+// registerVFS is vfs.Register, replaceable by tests.
+var registerVFS = vfs.Register
 
 // Stats are counters of the engine, for tests and measurement.
 type Stats struct {
@@ -58,7 +51,7 @@ type tail struct {
 type pending struct {
 	id  [idSize]byte
 	end int64
-	// sc is the scan of the WAL as the Leader left it, for the new tail.
+	// tail is the tail of the WAL as the Leader left it.
 	tail tail
 }
 
@@ -72,6 +65,10 @@ type Engine struct {
 	vname     string
 	fsys      *vfs.FS
 	ckptBytes int64
+	guard     db.Guard
+	ops       fileOps
+	// ckpt runs the node-local checkpoint; tests replace it.
+	ckpt func(*db.Conn) (*db.CheckpointMeta, error)
 
 	mu      sync.Mutex
 	sc      *db.SingleConn
@@ -91,21 +88,26 @@ func NewEngine(dir string, ckptBytes int64, logger *log.Logger) (*Engine, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	return newEngine(dir, ckptBytes, logger, osOps{})
+}
+
+func newEngine(dir string, ckptBytes int64, logger *log.Logger, ops fileOps) (*Engine, error) {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
 	if ckptBytes <= 0 {
 		ckptBytes = 4 << 20
 	}
-	e := &Engine{dir: dir, logger: logger, ckptBytes: ckptBytes, v: &fileVFS{dir: dir}}
+	e := &Engine{dir: dir, logger: logger, ckptBytes: ckptBytes, v: &fileVFS{dir: dir}, ops: ops,
+		ckpt: func(c *db.Conn) (*db.CheckpointMeta, error) { return c.Checkpoint(db.CheckpointTruncate) }}
 	e.dbPath = filepath.Join(dir, "wf.db")
 	e.walPath = e.dbPath + "-wal"
 	for _, p := range []string{e.dbPath, e.walPath, e.dbPath + "-journal"} {
-		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := e.ops.Remove(p); err != nil {
 			return nil, err
 		}
 	}
-	name, fsys, err := vfs.Register(e.v)
+	name, fsys, err := registerVFS(e.v)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +135,10 @@ func (e *Engine) openLocked() error {
 	if e.sc != nil {
 		return nil
 	}
-	sc, err := db.OpenSingleConn(db.ConnConfig{}, e.dsn, e.logger)
+	// The guard is an SQLite authorizer refusing, while a user request runs,
+	// the statements that write pages or change file-level settings outside
+	// the replicated WAL (see doc.go).
+	sc, err := db.OpenSingleConn(db.ConnConfig{Guard: &e.guard}, e.dsn, e.logger)
 	if err != nil {
 		return err
 	}
@@ -156,34 +161,25 @@ func (e *Engine) closeLocked() {
 	e.sc = nil
 }
 
-// ensureTail loads the committed tail from the WAL file when it is unknown.
+// ensureTailLocked loads the committed tail from the WAL file when it is unknown.
 func (e *Engine) ensureTailLocked() error {
 	if e.tl.valid {
 		return nil
 	}
-	w, err := os.ReadFile(e.walPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	t, err := tailFromWAL(w)
+	w, err := e.ops.ReadFile(e.walPath)
 	if err != nil {
 		return err
 	}
-	e.tl = t
+	s, err := scanOrEmpty(w)
+	if err != nil {
+		return err
+	}
+	e.tl = tailFromScan(s)
 	return nil
 }
 
-func tailFromWAL(w []byte) (tail, error) {
-	s, err := scanWAL(w)
-	if err != nil {
-		if errors.Is(err, errNoHeader) {
-			return tail{valid: true}, nil // no WAL: an empty tail
-		}
-		return tail{}, err
-	}
-	return tailFromScan(s), nil
-}
-
+// tailFromScan is the tail after the last commit of s; the empty scan gives
+// the empty tail.
 func tailFromScan(s walScan) tail {
 	t := tail{valid: true, end: s.CommitEnd, pageSize: s.Header.PageSize,
 		salt: [2]uint32{s.Header.Salt1, s.Header.Salt2}, c1: s.Header.Cksum1, c2: s.Header.Cksum2,
@@ -202,11 +198,6 @@ func tailFromScan(s walScan) tail {
 // before one of those two.
 func (e *Engine) Run(ctx context.Context, req *command.Request, xTime bool) ([]*command.ExecuteQueryResponse, *PageList, [idSize]byte, error) {
 	var id [idSize]byte
-	for _, st := range req.Statements {
-		if refused.MatchString(st.Sql) {
-			return nil, nil, id, fmt.Errorf("%w: %.40q", ErrRefused, st.Sql)
-		}
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.pend != nil {
@@ -222,7 +213,9 @@ func (e *Engine) Run(ctx context.Context, req *command.Request, xTime bool) ([]*
 	if err != nil {
 		return nil, nil, id, err
 	}
+	e.guard.Set(true)
 	res, rerr := conn.Request(ctx, req, xTime)
+	e.guard.Set(false)
 	// A request that leaves a transaction open would hold frames back from the
 	// WAL and let the next request commit them.
 	if in, ierr := conn.InTransaction(); ierr == nil && in {
@@ -231,30 +224,23 @@ func (e *Engine) Run(ctx context.Context, req *command.Request, xTime bool) ([]*
 	}
 	conn.Close()
 
-	w, err := os.ReadFile(e.walPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	w, err := e.ops.ReadFile(e.walPath)
+	if err != nil {
 		return res, nil, id, errors.Join(rerr, err)
 	}
-	s, err := scanWAL(w)
+	s, err := scanOrEmpty(w)
 	if err != nil {
-		return res, nil, id, rerr // no WAL: nothing was written
+		return res, nil, id, errors.Join(rerr, err)
 	}
-	from := e.tl.end
-	if from == 0 || s.Header.Salt1 != e.tl.salt[0] || s.Header.Salt2 != e.tl.salt[1] {
-		from = walHeaderSize // a new WAL generation
-	}
+	// Frames before the committed end are Raft's; a WAL with no frames (or
+	// none past it) means this request wrote nothing.
+	from := max(e.tl.end, walHeaderSize)
 	if s.CommitEnd <= from {
 		return res, nil, id, rerr
 	}
-	txs := extractTxs(w, s, from, s.CommitEnd)
-	if len(txs) == 0 {
-		return res, nil, id, rerr
-	}
-	if _, err := rand.Read(id[:]); err != nil {
-		return res, nil, id, err
-	}
+	rand.Read(id[:]) // never fails
 	e.pend = &pending{id: id, end: s.CommitEnd, tail: tailFromScan(s)}
-	return res, &PageList{PageSize: s.Header.PageSize, Txs: txs}, id, rerr
+	return res, &PageList{PageSize: s.Header.PageSize, Txs: extractTxs(w, s, from, s.CommitEnd)}, id, rerr
 }
 
 // Undo removes the local frames of request id, which Raft did not commit:
@@ -277,7 +263,7 @@ func (e *Engine) undoLocked() error {
 	e.closeLocked()
 	e.pend = nil
 	e.stats.Undos++
-	if err := os.Truncate(e.walPath, e.tl.end); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := e.ops.Truncate(e.walPath, e.tl.end); err != nil {
 		e.tl.valid = false
 		return err
 	}
@@ -323,82 +309,47 @@ func (e *Engine) Commit(id [idSize]byte, pl *PageList) error {
 func (e *Engine) appendLocked(pl *PageList) error {
 	t := e.tl
 	var out []byte
-	fresh := t.end == 0
-	if fresh {
+	off := t.end
+	if t.end == 0 {
 		var salt [8]byte
-		if _, err := rand.Read(salt[:]); err != nil {
-			return err
-		}
-		t = tail{valid: true, pageSize: pl.PageSize, bigEnd: true,
-			salt: [2]uint32{binary.BigEndian.Uint32(salt[:4]), binary.BigEndian.Uint32(salt[4:])}}
-		hdr := make([]byte, walHeaderSize)
-		be := binary.BigEndian
-		be.PutUint32(hdr[0:], walMagicBE)
-		be.PutUint32(hdr[4:], 3007000)
-		be.PutUint32(hdr[8:], pl.PageSize)
-		be.PutUint32(hdr[16:], t.salt[0])
-		be.PutUint32(hdr[20:], t.salt[1])
-		t.c1, t.c2 = cksum(true, hdr[:24], 0, 0)
-		be.PutUint32(hdr[24:], t.c1)
-		be.PutUint32(hdr[28:], t.c2)
-		out = hdr
-		t.end = walHeaderSize
-	}
-	be := binary.BigEndian
-	start := t.end
-	for _, tx := range pl.Txs {
-		for i, pg := range tx.Pages {
-			fh := make([]byte, frameHeaderSize)
-			be.PutUint32(fh[0:], tx.Pgnos[i])
-			if i == len(tx.Pages)-1 {
-				be.PutUint32(fh[4:], tx.DBSize)
-			}
-			be.PutUint32(fh[8:], t.salt[0])
-			be.PutUint32(fh[12:], t.salt[1])
-			t.c1, t.c2 = cksum(t.bigEnd, fh[:8], t.c1, t.c2)
-			t.c1, t.c2 = cksum(t.bigEnd, pg, t.c1, t.c2)
-			be.PutUint32(fh[16:], t.c1)
-			be.PutUint32(fh[20:], t.c2)
-			out = append(out, fh...)
-			out = append(out, pg...)
-			t.end += int64(len(fh) + len(pg))
-		}
-		e.stats.Pages += len(tx.Pages)
-	}
-	// SQLite deletes a WAL it finds next to an empty database file
-	// (pagerOpenWalIfPresent: nPage==0). A node that has only ever applied
-	// page lists has no database file, so seed it with page 1 as the first
-	// transaction wrote it; the WAL overlays it anyway.
-	if st, serr := os.Stat(e.dbPath); serr != nil || st.Size() == 0 {
-		for _, tx := range pl.Txs {
-			for i, pg := range tx.Pages {
-				if tx.Pgnos[i] == 1 {
-					if err := os.WriteFile(e.dbPath, pg, 0o644); err != nil {
-						return err
-					}
-					goto seeded
-				}
-			}
-		}
-	}
-seeded:
-	f, err := os.OpenFile(e.walPath, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	off := start
-	if fresh {
+		rand.Read(salt[:]) // never fails
+		out, t = newWALHeader(pl.PageSize, [2]uint32{binary.BigEndian.Uint32(salt[:4]), binary.BigEndian.Uint32(salt[4:])})
 		off = 0 // out starts with the new header
 	}
-	if _, err := f.WriteAt(out, off); err != nil {
+	out = frameTxs(&t, out, pl.Txs)
+	pages := 0
+	for _, tx := range pl.Txs {
+		pages += len(tx.Pages)
+	}
+	if err := e.seedDB(pl); err != nil {
 		return err
 	}
-	if err := f.Truncate(t.end); err != nil { // drop any stale tail beyond the new end
+	// Truncate drops any stale tail beyond the new end.
+	if err := e.ops.WriteAtTruncate(e.walPath, out, off, t.end); err != nil {
 		return err
 	}
 	e.tl = t
 	e.stats.Applies++
+	e.stats.Pages += pages
+	return nil
+}
+
+// seedDB gives an empty database file page 1. SQLite deletes a WAL it finds
+// next to an empty database file (pagerOpenWalIfPresent: nPage==0), and a node
+// that has only ever applied page lists has no database file; page 1 as the
+// first transaction wrote it is enough, the WAL overlays it anyway.
+func (e *Engine) seedDB(pl *PageList) error {
+	n, err := e.ops.Size(e.dbPath)
+	if err != nil || n > 0 {
+		return err
+	}
+	for _, tx := range pl.Txs {
+		for i, pg := range tx.Pages {
+			if tx.Pgnos[i] == 1 {
+				return e.ops.WriteFile(e.dbPath, pg)
+			}
+		}
+	}
 	return nil
 }
 
@@ -406,7 +357,7 @@ seeded:
 // large. Checkpoints are never replicated: the page list is independent of
 // each node's WAL layout.
 func (e *Engine) maybeCheckpointLocked() error {
-	if e.pend != nil || e.tl.end < e.ckptBytes {
+	if e.tl.end < e.ckptBytes {
 		return nil
 	}
 	return e.checkpointLocked()
@@ -420,7 +371,7 @@ func (e *Engine) checkpointLocked() error {
 	if err != nil {
 		return err
 	}
-	meta, err := conn.Checkpoint(db.CheckpointTruncate)
+	meta, err := e.ckpt(conn)
 	conn.Close()
 	if err != nil {
 		return err
@@ -434,7 +385,7 @@ func (e *Engine) checkpointLocked() error {
 	return nil
 }
 
-// Checkpoint runs a node-local checkpoint now (a no-op with a request pending).
+// Checkpoint runs a node-local checkpoint now (refused with a request pending).
 func (e *Engine) Checkpoint() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -457,17 +408,9 @@ func (e *Engine) Query(ctx context.Context, req *command.Request, xTime bool) ([
 		return nil, err
 	}
 	defer conn.Close()
+	e.guard.Set(true)
+	defer e.guard.Set(false)
 	return conn.Query(ctx, req, xTime)
-}
-
-// Time-measuring helper for callers: reopen cost of the connection now.
-func (e *Engine) Reopen() (time.Duration, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.closeLocked()
-	t0 := time.Now()
-	err := e.openLocked()
-	return time.Since(t0), err
 }
 
 // PageImage returns the database as SQLite sees its committed pages: the
@@ -480,17 +423,17 @@ func (e *Engine) PageImage() ([]byte, error) {
 	if err := e.ensureTailLocked(); err != nil {
 		return nil, err
 	}
-	d, err := os.ReadFile(e.dbPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	w, err := os.ReadFile(e.walPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	s, err := scanWAL(w)
+	d, err := e.ops.ReadFile(e.dbPath)
 	if err != nil {
-		return d, nil
+		return nil, err
+	}
+	w, err := e.ops.ReadFile(e.walPath)
+	if err != nil {
+		return nil, err
+	}
+	s, err := scanOrEmpty(w)
+	if err != nil {
+		return nil, err
 	}
 	ps := int64(s.Header.PageSize)
 	size := int64(len(d))
@@ -524,13 +467,13 @@ func (e *Engine) snapshotBytes() ([]byte, error) {
 	if err := e.ensureTailLocked(); err != nil {
 		return nil, err
 	}
-	d, err := os.ReadFile(e.dbPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	d, err := e.ops.ReadFile(e.dbPath)
+	if err != nil {
 		return nil, err
 	}
 	var w []byte
 	if e.tl.end > 0 {
-		w, err = os.ReadFile(e.walPath)
+		w, err = e.ops.ReadFile(e.walPath)
 		if err != nil {
 			return nil, err
 		}
@@ -563,14 +506,14 @@ func (e *Engine) restoreBytes(b []byte) error {
 	defer e.mu.Unlock()
 	e.closeLocked()
 	e.pend = nil
-	if err := os.WriteFile(e.dbPath, d, 0o644); err != nil {
+	if err := e.ops.WriteFile(e.dbPath, d); err != nil {
 		return err
 	}
 	if len(w) == 0 {
-		if err := os.Remove(e.walPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := e.ops.Remove(e.walPath); err != nil {
 			return err
 		}
-	} else if err := os.WriteFile(e.walPath, w, 0o644); err != nil {
+	} else if err := e.ops.WriteFile(e.walPath, w); err != nil {
 		return err
 	}
 	e.tl = tail{}

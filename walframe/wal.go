@@ -104,6 +104,17 @@ func scanWAL(b []byte) (walScan, error) {
 	return s, nil
 }
 
+// scanOrEmpty is scanWAL for a file that may not hold a WAL yet: no header
+// (a missing, empty or short file) is the empty scan, anything else wrong
+// with the header is an error.
+func scanOrEmpty(b []byte) (walScan, error) {
+	s, err := scanWAL(b)
+	if errors.Is(err, errNoHeader) {
+		return walScan{}, nil
+	}
+	return s, err
+}
+
 // extractTxs returns the committed transactions found in wal between byte
 // offsets [from, to), to being a commit boundary.
 func extractTxs(wal []byte, s walScan, from, to int64) []Tx {
@@ -127,31 +138,27 @@ func extractTxs(wal []byte, s walScan, from, to int64) []Tx {
 	return out
 }
 
-// appendTxs re-frames txs at the end of the valid part of a WAL image (dqlite's
-// vfsWalAppend): own salts, own checksum chain. A missing or empty WAL gets a
-// fresh header with the given salts.
-func appendTxs(wal []byte, pageSize uint32, txs []Tx, salt [2]uint32) []byte {
+// newWALHeader returns the header of a fresh WAL (big-endian checksums, as
+// dqlite writes it) and the tail positioned just after it.
+func newWALHeader(pageSize uint32, salt [2]uint32) ([]byte, tail) {
 	be := binary.BigEndian
-	s, err := scanWAL(wal)
-	if err != nil {
-		hdr := make([]byte, walHeaderSize)
-		be.PutUint32(hdr[0:], walMagicBE)
-		be.PutUint32(hdr[4:], 3007000)
-		be.PutUint32(hdr[8:], pageSize)
-		be.PutUint32(hdr[16:], salt[0])
-		be.PutUint32(hdr[20:], salt[1])
-		c1, c2 := cksum(true, hdr[:24], 0, 0)
-		be.PutUint32(hdr[24:], c1)
-		be.PutUint32(hdr[28:], c2)
-		wal = hdr
-		s, _ = scanWAL(wal)
-	}
-	wal = wal[:s.CommitEnd]
-	bigEnd := s.Header.Magic&1 == 1
-	c1, c2 := s.Header.Cksum1, s.Header.Cksum2
-	if n := len(s.Valid); n > 0 {
-		c1, c2 = s.Valid[n-1].C1, s.Valid[n-1].C2
-	}
+	hdr := make([]byte, walHeaderSize)
+	be.PutUint32(hdr[0:], walMagicBE)
+	be.PutUint32(hdr[4:], 3007000)
+	be.PutUint32(hdr[8:], pageSize)
+	be.PutUint32(hdr[16:], salt[0])
+	be.PutUint32(hdr[20:], salt[1])
+	t := tail{valid: true, pageSize: pageSize, bigEnd: true, salt: salt, end: walHeaderSize}
+	t.c1, t.c2 = cksum(true, hdr[:24], 0, 0)
+	be.PutUint32(hdr[24:], t.c1)
+	be.PutUint32(hdr[28:], t.c2)
+	return hdr, t
+}
+
+// frameTxs appends txs to out as WAL frames under t's salts and checksum
+// chain (dqlite's vfsWalAppend), and advances t.
+func frameTxs(t *tail, out []byte, txs []Tx) []byte {
+	be := binary.BigEndian
 	for _, tx := range txs {
 		for i, pg := range tx.Pages {
 			fh := make([]byte, frameHeaderSize)
@@ -159,15 +166,16 @@ func appendTxs(wal []byte, pageSize uint32, txs []Tx, salt [2]uint32) []byte {
 			if i == len(tx.Pages)-1 {
 				be.PutUint32(fh[4:], tx.DBSize)
 			}
-			be.PutUint32(fh[8:], s.Header.Salt1)
-			be.PutUint32(fh[12:], s.Header.Salt2)
-			c1, c2 = cksum(bigEnd, fh[:8], c1, c2)
-			c1, c2 = cksum(bigEnd, pg, c1, c2)
-			be.PutUint32(fh[16:], c1)
-			be.PutUint32(fh[20:], c2)
-			wal = append(wal, fh...)
-			wal = append(wal, pg...)
+			be.PutUint32(fh[8:], t.salt[0])
+			be.PutUint32(fh[12:], t.salt[1])
+			t.c1, t.c2 = cksum(t.bigEnd, fh[:8], t.c1, t.c2)
+			t.c1, t.c2 = cksum(t.bigEnd, pg, t.c1, t.c2)
+			be.PutUint32(fh[16:], t.c1)
+			be.PutUint32(fh[20:], t.c2)
+			out = append(out, fh...)
+			out = append(out, pg...)
+			t.end += int64(len(fh) + len(pg))
 		}
 	}
-	return wal
+	return out
 }

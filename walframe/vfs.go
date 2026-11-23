@@ -2,7 +2,6 @@ package walframe
 
 import (
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -61,13 +60,7 @@ type osFile struct {
 	f *os.File
 }
 
-func (f *osFile) ReadAt(p []byte, off int64) (int, error) {
-	n, err := f.f.ReadAt(p, off)
-	if err == io.EOF && n == len(p) {
-		err = nil
-	}
-	return n, err
-}
+func (f *osFile) ReadAt(p []byte, off int64) (int, error) { return f.f.ReadAt(p, off) }
 
 func (f *osFile) WriteAt(p []byte, off int64) (int, error) {
 	if f.v.fenced.Load() {

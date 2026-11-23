@@ -35,6 +35,11 @@ type Node struct {
 	// afterLocalExec, if set, is called on the Leader between local execution
 	// and the Raft proposal. For tests of lost leadership.
 	afterLocalExec func()
+	// behind and barrier, if set, replace the Leader's check that it has applied
+	// its whole log and the barrier that makes it so. For tests: a real lag is
+	// not reproducible on demand.
+	behind  func() bool
+	barrier func() error
 
 	fatalMu sync.Mutex
 	fatal   error
@@ -76,8 +81,8 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 	}
 	// A new Leader must have applied every entry of previous terms before it
 	// runs anything against its database.
-	if n.raft.AppliedIndex() < n.raft.LastIndex() {
-		if err := n.raft.Barrier(n.applyTimeout).Error(); err != nil {
+	if n.behindFn() {
+		if err := n.barrierFn(); err != nil {
 			return nil, fmt.Errorf("walframe: barrier: %w", err)
 		}
 	}
@@ -88,12 +93,7 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 	if n.afterLocalExec != nil {
 		n.afterLocalExec()
 	}
-	data, merr := marshalCommand(id, pl)
-	if merr != nil {
-		n.eng.Undo(id)
-		return nil, merr
-	}
-	f := n.raft.Apply(data, n.applyTimeout)
+	f := n.raft.Apply(marshalCommand(id, pl), n.applyTimeout)
 	if ferr := f.Error(); ferr != nil {
 		if uerr := n.eng.Undo(id); uerr != nil {
 			return nil, fmt.Errorf("walframe: %w (and undo failed: %v)", ferr, uerr)
@@ -104,6 +104,23 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 		return res, rerr
 	}
 	return res, err
+}
+
+// behind reports whether the log holds entries this node has not applied.
+func behind(applied, last uint64) bool { return applied < last }
+
+func (n *Node) behindFn() bool {
+	if n.behind != nil {
+		return n.behind()
+	}
+	return behind(n.raft.AppliedIndex(), n.raft.LastIndex())
+}
+
+func (n *Node) barrierFn() error {
+	if n.barrier != nil {
+		return n.barrier()
+	}
+	return n.raft.Barrier(n.applyTimeout).Error()
 }
 
 // Query runs read-only statements on this node's committed state.

@@ -417,11 +417,35 @@ func TestRefusedStatements(t *testing.T) {
 		"PRAGMA page_size=8192",
 		"PRAGMA auto_vacuum=FULL",
 		"PRAGMA synchronous=FULL",
+		"PRAGMA/**/journal_mode=delete",
+		"pragma  JOURNAL_MODE",
+		"-- hi\nPRAGMA\n\tJournal_Mode=OFF",
+		"SELECT 1; ATTACH DATABASE 'y.db' AS y",
+		"/* c */ ATTACH 'z.db' AS z; SELECT 2",
+		"DETACH DATABASE x",
+		"PRAGMA [main].[wal_checkpoint]",
+		"PRAGMA writable_schema=ON",
 	} {
-		_, err := c.leader().n.Execute(context.Background(), req(s))
-		if err == nil || !strings.Contains(err.Error(), "refused") {
-			t.Errorf("%q: expected a refusal, got %v", s, err)
+		res, err := c.leader().n.Execute(context.Background(), req(s))
+		if err != nil {
+			t.Errorf("%q: request error %v", s, err)
+			continue
 		}
+		// A leading SELECT answers as rows, anything else as an execute result.
+		if len(res) != 1 || !strings.Contains(res[0].String(), "not authorized") {
+			t.Errorf("%q: expected a statement error \"not authorized\", got %v", s, res)
+		}
+		rows, qerr := c.leader().n.Query(context.Background(), req(s))
+		if qerr != nil || len(rows) != 1 || !strings.Contains(rows[0].Error, "not authorized") {
+			t.Errorf("%q: query path: expected \"not authorized\", got %v %v", s, rows, qerr)
+		}
+	}
+	// Nothing was replicated, and the connection is still in WAL mode.
+	if got := c.rows(c.leader(), "PRAGMA journal_mode"); !strings.Contains(got, "not authorized") {
+		t.Errorf("journal_mode readable by a user: %s", got)
+	}
+	if st := c.leader().n.eng.Stats(); st.OwnCommits != 0 {
+		t.Errorf("refused statements were replicated: %+v", st)
 	}
 	// A transaction left open across requests is rolled back and reported.
 	_, err := c.leader().n.Execute(context.Background(), req("CREATE TABLE t(a)", "BEGIN", "INSERT INTO t VALUES(1)"))
