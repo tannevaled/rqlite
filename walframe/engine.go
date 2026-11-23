@@ -420,9 +420,6 @@ func (e *Engine) Query(ctx context.Context, req *command.Request, xTime bool) ([
 func (e *Engine) PageImage() ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if err := e.ensureTailLocked(); err != nil {
-		return nil, err
-	}
 	d, err := e.ops.ReadFile(e.dbPath)
 	if err != nil {
 		return nil, err
@@ -435,10 +432,14 @@ func (e *Engine) PageImage() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	end := e.tl.end
+	if !e.tl.valid {
+		end = s.CommitEnd // the tail is unknown: the WAL's last commit is it
+	}
 	ps := int64(s.Header.PageSize)
 	size := int64(len(d))
 	for _, f := range s.Valid {
-		if f.Offset >= e.tl.end {
+		if f.Offset >= end {
 			break
 		}
 		if f.Commit != 0 {
@@ -448,7 +449,7 @@ func (e *Engine) PageImage() ([]byte, error) {
 	img := make([]byte, size)
 	copy(img, d)
 	for _, f := range s.Valid {
-		if f.Offset >= e.tl.end {
+		if f.Offset >= end {
 			break
 		}
 		o := (int64(f.Pgno) - 1) * ps

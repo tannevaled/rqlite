@@ -495,6 +495,70 @@ func corruptWAL(ps uint32) []byte {
 	return w
 }
 
+// corruptAfterRun is osOps whose WAL reads return a corrupt WAL once armed.
+type corruptAfterRun struct {
+	osOps
+	armed bool
+}
+
+func (c *corruptAfterRun) ReadFile(p string) ([]byte, error) {
+	if c.armed && strings.HasSuffix(p, "-wal") {
+		return corruptWAL(512), nil
+	}
+	return c.osOps.ReadFile(p)
+}
+
+// A WAL that is corrupt only when read back after the request is reported with
+// the request's result and no page list.
+func TestEngineRunReadsACorruptWALAfterTheRequest(t *testing.T) {
+	defer nopanic(t)
+	ops := &corruptAfterRun{}
+	e, err := newEngine(t.TempDir(), 1<<30, nil, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	pl0, id0 := runOK(t, e, "CREATE TABLE t(x)")
+	if err := e.Commit(id0, pl0); err != nil {
+		t.Fatal(err)
+	}
+	ops.armed = true
+	res, pl, _, err := e.Run(bg, req("INSERT INTO t VALUES(1)"), false)
+	if err == nil || pl != nil || res == nil {
+		t.Errorf("Run: res %v, pl %v, err %v", res, pl, err)
+	}
+	if e.pend != nil {
+		t.Error("a pending request was recorded")
+	}
+}
+
+// closeLocked on an engine with no connection changes nothing.
+func TestCloseLockedWithoutAConnection(t *testing.T) {
+	e := testEngine(t, 1<<30)
+	func() {
+		defer func() { recover() }()
+		e.closeLocked()
+	}()
+	if e.v.fenced.Load() {
+		t.Error("closing nothing fenced the storage")
+	}
+}
+
+func TestPageImageWithAnUnknownTail(t *testing.T) {
+	defer nopanic(t)
+	e := testEngine(t, 1<<30)
+	pl, id := runOK(t, e, "CREATE TABLE t(x)", "INSERT INTO t VALUES(1)")
+	if err := e.Commit(id, pl); err != nil {
+		t.Fatal(err)
+	}
+	want := image(t, e)
+	e.tl = tail{}
+	got, err := e.PageImage()
+	if err != nil || !bytes.Equal(got, want) {
+		t.Errorf("image with an unknown tail differs: %v", err)
+	}
+}
+
 func TestEngineCorruptWAL(t *testing.T) {
 	defer nopanic(t)
 	e := testEngine(t, 1<<30)
@@ -620,6 +684,17 @@ func TestNewEngine(t *testing.T) {
 	os.WriteFile(file, nil, 0o644)
 	if _, err := NewEngine(filepath.Join(file, "sub"), 0, nil); err == nil {
 		t.Error("directory under a file")
+	}
+
+	// The directory is created, nested.
+	deep := filepath.Join(d, "a", "b")
+	if x, err := NewEngine(deep, 0, nil); err != nil {
+		t.Error(err)
+	} else {
+		x.Close()
+		if st, err := os.Stat(deep); err != nil || !st.IsDir() {
+			t.Errorf("directory not created: %v", err)
+		}
 	}
 
 	// A leftover database is removed.

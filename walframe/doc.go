@@ -31,7 +31,7 @@
 // SQLite authorizer (db.Guard) at prepare time, so comments, spacing, case and
 // multi-statement strings cannot get past it. One hole is known: VACUUM
 // attaches a private database with an empty file name, which must be allowed,
-// so ATTACH '' AS x is allowed too; it is an empty, per-connection database
+// so ATTACH ” AS x is allowed too; it is an empty, per-connection database
 // that is not replicated, and statements that use it would diverge. Node-local
 // page writers (auto-VACUUM,
 // auto-optimize) are refused or absent; user-issued VACUUM, ANALYZE and PRAGMA

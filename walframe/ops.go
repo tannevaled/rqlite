@@ -58,11 +58,10 @@ func (osOps) Size(path string) (int64, error) {
 }
 
 func (osOps) WriteAtTruncate(path string, b []byte, off, size int64) error {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return err
-	}
+	// When the open fails f is nil, whose methods all return os.ErrInvalid, so
+	// the open error leads the joined result and no branch is needed.
+	f, oerr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	_, werr := f.WriteAt(b, off)
 	terr := f.Truncate(size)
-	return errors.Join(werr, terr, f.Close())
+	return errors.Join(oerr, werr, terr, f.Close())
 }
