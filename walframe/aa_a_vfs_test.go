@@ -6,6 +6,35 @@ import (
 	"testing"
 )
 
+// closeLocked on an engine with no connection changes nothing. It is first
+// because a mutant here panics in every later engine test's cleanup, and the
+// assertion must be the first failure seen.
+func TestCloseLockedWithoutAConnection(t *testing.T) {
+	e := testEngine(t, 1<<30)
+	func() {
+		defer func() { recover() }()
+		e.closeLocked()
+	}()
+	if e.v.fenced.Load() {
+		t.Error("closing nothing fenced the storage")
+	}
+	e.v.fenced.Store(false)
+}
+
+// An unwritable parent makes MkdirAll fail where no file removal does.
+func TestNewEngineMkdirFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	d := t.TempDir()
+	os.Chmod(d, 0o500)
+	defer os.Chmod(d, 0o700)
+	if e, err := NewEngine(filepath.Join(d, "sub"), 0, nil); err == nil {
+		e.Close()
+		t.Error("NewEngine created a directory in an unwritable parent")
+	}
+}
+
 // This file sorts first: a VFS whose Access misreports a missing file makes
 // SQLite retry forever, so the engine tests after it would hang instead of
 // failing. Run the suite with -failfast.

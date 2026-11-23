@@ -532,18 +532,6 @@ func TestEngineRunReadsACorruptWALAfterTheRequest(t *testing.T) {
 	}
 }
 
-// closeLocked on an engine with no connection changes nothing.
-func TestCloseLockedWithoutAConnection(t *testing.T) {
-	e := testEngine(t, 1<<30)
-	func() {
-		defer func() { recover() }()
-		e.closeLocked()
-	}()
-	if e.v.fenced.Load() {
-		t.Error("closing nothing fenced the storage")
-	}
-}
-
 func TestPageImageWithAnUnknownTail(t *testing.T) {
 	defer nopanic(t)
 	e := testEngine(t, 1<<30)
