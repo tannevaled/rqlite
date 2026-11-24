@@ -355,7 +355,7 @@ func TestGuardOnARealConnection(t *testing.T) {
 }
 
 // An ATTACH whose file name is not a literal reaches the authorizer as a NULL
-// pointer; VACUUM's own ATTACH carries the literal ''.
+// pointer; VACUUM's own ATTACH carries the literal ”.
 func TestGuardDeniesNullAttach(t *testing.T) {
 	for _, c := range []struct {
 		mode, op int32

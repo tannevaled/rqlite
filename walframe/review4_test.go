@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -281,4 +282,81 @@ func TestEachHalfOfTheTempFixHasItsOwnCase(t *testing.T) {
 		t.Error("half 2: CREATE TABLE in an attached private database acknowledged")
 	}
 	c.mustExec(req("INSERT INTO t VALUES(1)"))
+}
+
+// stepDown calls the transfer once when it succeeds, retries a failure up to
+// stepDownTries times, and calls it never on a node that is not the Leader.
+func TestStepDownTransfersAndRetries(t *testing.T) {
+	c := newCluster(t, 3, 1<<30)
+	l := c.leader()
+	calls := 0
+	l.n.transfer = func() error { calls++; return nil } // the node stays Leader
+	l.n.stepDown()
+	if calls != 1 {
+		t.Errorf("a successful transfer was called %d times", calls)
+	}
+	calls = 0
+	l.n.transfer = func() error {
+		calls++
+		if calls < 3 {
+			return errInjected
+		}
+		return nil
+	}
+	l.n.stepDown()
+	if calls != 3 {
+		t.Errorf("a transfer failing twice was called %d times, want 3", calls)
+	}
+	calls = 0
+	l.n.transfer = func() error { calls++; return errInjected }
+	l.n.stepDown()
+	if calls != stepDownTries {
+		t.Errorf("a failing transfer was called %d times, want %d", calls, stepDownTries)
+	}
+	for _, tn := range c.nodes {
+		if tn == l {
+			continue
+		}
+		calls = 0
+		tn.n.transfer = func() error { calls++; return nil }
+		tn.n.stepDown()
+		if calls != 0 {
+			t.Errorf("a follower called the transfer %d times", calls)
+		}
+	}
+}
+
+// The goroutine that watches Raft's state returns when Raft shuts down.
+func TestLeadershipWatcherEndsWithRaft(t *testing.T) {
+	c := newCluster(t, 1, 1<<30)
+	n := c.leader().n
+	if n.watchDone == nil {
+		t.Fatal("no watcher")
+	}
+	select {
+	case <-n.watchDone:
+		t.Fatal("the watcher returned while Raft runs")
+	default:
+	}
+	if err := c.leader().r.Shutdown().Error(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-n.watchDone:
+	case <-time.After(3 * time.Second):
+		t.Error("the watcher outlived Raft")
+	}
+}
+
+// A Leader whose barrier failed does not serve the read.
+func TestQueryRefusesWhenTheBarrierFails(t *testing.T) {
+	c := newCluster(t, 3, 1<<30)
+	c.mustExec(req("CREATE TABLE t(x)"))
+	l := c.leader()
+	l.n.barrierTerm = 0
+	l.n.barrier = func() error { return errInjected }
+	rows, err := l.n.Query(bg, req("SELECT count(*) FROM t"))
+	if !errors.Is(err, errInjected) || rows != nil {
+		t.Errorf("Query after a failed barrier: rows=%v err=%v", rows, err)
+	}
 }

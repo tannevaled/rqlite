@@ -43,6 +43,10 @@ type Node struct {
 	// barrierTerm is the Raft term in which this node last ran its barrier
 	// (under reqMu); terms start at 1.
 	barrierTerm uint64
+	// transfer, if set, replaces the leadership transfer; watchDone is closed when
+	// the goroutine watching Raft's state returns (at Raft's shutdown). For tests.
+	transfer  func() error
+	watchDone chan struct{}
 
 	fatalMu sync.Mutex
 	fatal   error
@@ -144,12 +148,20 @@ func (n *Node) stepDown() {
 		if r == nil || r.State() != raft.Leader {
 			return
 		}
-		if err = r.LeadershipTransfer().Error(); err == nil {
+		if err = n.transferFn(r); err == nil {
 			return
 		}
 		time.Sleep(stepDownPause)
 	}
 	n.log.Printf("walframe: stopped, and cannot give up leadership: %v", err)
+}
+
+// transferFn hands the leadership over; a test replaces it to count the calls.
+func (n *Node) transferFn(r *raft.Raft) error {
+	if n.transfer != nil {
+		return n.transfer()
+	}
+	return r.LeadershipTransfer().Error()
 }
 
 // A failed transfer (no peer ready, an election in progress) is retried.
@@ -168,7 +180,10 @@ func (n *Node) watchLeadership(r *raft.Raft) {
 		return ok
 	})
 	r.RegisterObserver(obs)
+	done := make(chan struct{})
+	n.watchDone = done
 	go func() {
+		defer close(done)
 		defer r.DeregisterObserver(obs)
 		for o := range ch {
 			st := o.Data.(raft.RaftState)
