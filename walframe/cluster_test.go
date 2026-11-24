@@ -23,7 +23,7 @@ type tnode struct {
 }
 
 type cluster struct {
-	t     *testing.T
+	t     testing.TB
 	nodes []*tnode
 	ckpt  int64
 }
@@ -67,7 +67,7 @@ func (c *cluster) addNode(id string) *tnode {
 }
 
 // newCluster starts n voters, the first bootstrapping with all of them.
-func newCluster(t *testing.T, n int, ckptBytes int64) *cluster {
+func newCluster(t testing.TB, n int, ckptBytes int64) *cluster {
 	t.Helper()
 	c := &cluster{t: t, ckpt: ckptBytes}
 	for i := 0; i < n; i++ {
