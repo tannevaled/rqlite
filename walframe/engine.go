@@ -857,6 +857,9 @@ func parseSnapshot(b []byte) (*snapshotState, error) {
 	if dps != ps || int64(len(s.d))%ps != 0 {
 		return bad("the database file does not match the page size %d", ps)
 	}
+	// The size the database has after the last committed transaction: the last
+	// commit frame of the WAL if it has one, the file's size otherwise.
+	want := uint32(int64(len(s.d)) / ps)
 	if len(s.w) > 0 {
 		sc, err := scanWAL(s.w)
 		if err != nil {
@@ -865,6 +868,17 @@ func parseSnapshot(b []byte) (*snapshotState, error) {
 		if int64(sc.Header.PageSize) != ps || sc.CommitEnd != int64(len(s.w)) {
 			return bad("the WAL does not match the page size or is not whole")
 		}
+		if n := len(sc.Valid); n > 0 {
+			want = sc.Valid[n-1].Commit
+		}
+	}
+	// The header fields are installed as they stand and every later page list is
+	// checked against them: they must agree with the files they describe.
+	if s.dbPages != want {
+		return bad("%d pages declared, the files hold %d", s.dbPages, want)
+	}
+	if s.head == ([HashSize]byte{}) {
+		return bad("no head hash for a database at sequence %d", s.seq)
 	}
 	return s, nil
 }

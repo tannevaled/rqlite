@@ -123,6 +123,16 @@ func guardDeniesMode(mode, op int32, z1, z2 string) bool {
 	return false
 }
 
+// guardDeniesNullAttach reports whether the guard refuses an ATTACH whose file
+// name reached the authorizer as a NULL pointer. SQLite passes the name only
+// when it is a string LITERAL (VACUUM's own ATTACH is the literal ”); an
+// expression ('p' || ”), a bound parameter or any computed name arrives as NULL,
+// which GoString turns into "" and would pass for VACUUM's. Such a name can open
+// any file, so a NULL is always refused.
+func guardDeniesNullAttach(mode, op int32, z1 uintptr) bool {
+	return mode == guardWrite && op == sqlite3.SQLITE_ATTACH && z1 == 0
+}
+
 // guardDeniesSchema reports whether the write-mode guard refuses an action that
 // changes a database other than "main": z3, the authorizer's third argument, names
 // it. The temp schema and the private database of ATTACH ” (let through for
@@ -173,7 +183,7 @@ func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, z3, _ uintptr)
 	case sqlite3.SQLITE_CREATE_VTABLE:
 		s1, s2 = libc.GoString(z1), libc.GoString(z2)
 	}
-	if guardDeniesMode(mode, op, s1, s2) {
+	if guardDeniesNullAttach(mode, op, z1) || guardDeniesMode(mode, op, s1, s2) {
 		return sqlite3.SQLITE_DENY
 	}
 	if z3 != 0 && guardDeniesSchema(mode, op, libc.GoString(z3)) {

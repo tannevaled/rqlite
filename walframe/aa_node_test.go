@@ -101,7 +101,7 @@ func TestNodeBarrier(t *testing.T) {
 	if n.needBarrier(n.raft.CurrentTerm()) {
 		t.Error("a quiet leader is behind")
 	}
-	if err := n.barrierFn(); err != nil {
+	if err := n.barrierFn(bg); err != nil {
 		t.Errorf("real barrier: %v", err)
 	}
 }

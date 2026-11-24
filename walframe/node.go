@@ -66,7 +66,10 @@ func NewNode(e *Engine, logger *log.Logger) *Node {
 func (n *Node) Engine() *Engine { return n.eng }
 
 // SetRaft gives the node the Raft instance it replicates through.
-func (n *Node) SetRaft(r *raft.Raft) { n.raft = r }
+func (n *Node) SetRaft(r *raft.Raft) {
+	n.raft = r
+	n.watchLeadership(r)
+}
 
 // Fatal returns the error that made this node refuse an entry, if any. A node
 // that cannot apply a committed entry has diverged and must be rebuilt from a
@@ -95,12 +98,8 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 	// answers after the FSM has applied everything before it, can, and within one
 	// term every later entry is this node's own, applied before its request
 	// returns. So: once per term.
-	term := n.raft.CurrentTerm()
-	if n.needBarrier(term) {
-		if err := n.barrierFn(); err != nil {
-			return nil, fmt.Errorf("walframe: barrier: %w", err)
-		}
-		n.barrierTerm = term
+	if err := n.ensureBarrier(ctx); err != nil {
+		return nil, err
 	}
 	res, pl, id, err := n.eng.Run(ctx, req, false)
 	if pl == nil {
@@ -136,29 +135,93 @@ func (n *Node) needBarrier(term uint64) bool {
 
 // stepDown gives up Raft leadership: a Leader whose engine stopped would fail
 // every write and keep the cluster from electing a healthy one. It cannot help
-// a single-node cluster, and a stopped node may be elected again later, when it
-// steps down again.
+// a single-node cluster. A failed transfer is retried, and watchLeadership calls
+// it again each time the node is elected while stopped.
 func (n *Node) stepDown() {
 	r := n.raft
-	if r == nil || r.State() != raft.Leader {
-		return
+	var err error
+	for i := 0; i < stepDownTries; i++ {
+		if r == nil || r.State() != raft.Leader {
+			return
+		}
+		if err = r.LeadershipTransfer().Error(); err == nil {
+			return
+		}
+		time.Sleep(stepDownPause)
 	}
-	if err := r.LeadershipTransfer().Error(); err != nil {
-		n.log.Printf("walframe: stopped, and cannot give up leadership: %v", err)
-	}
+	n.log.Printf("walframe: stopped, and cannot give up leadership: %v", err)
 }
 
-func (n *Node) barrierFn() error {
+// A failed transfer (no peer ready, an election in progress) is retried.
+const (
+	stepDownTries = 5
+	stepDownPause = 100 * time.Millisecond
+)
+
+// watchLeadership steps down every time this node becomes Leader while its engine
+// is stopped: the stop hook fires once, but a stopped node is elected again
+// whenever its log is as current as the others'.
+func (n *Node) watchLeadership(r *raft.Raft) {
+	ch := make(chan raft.Observation, 16)
+	obs := raft.NewObserver(ch, false, func(o *raft.Observation) bool {
+		_, ok := o.Data.(raft.RaftState)
+		return ok
+	})
+	r.RegisterObserver(obs)
+	go func() {
+		defer r.DeregisterObserver(obs)
+		for o := range ch {
+			st := o.Data.(raft.RaftState)
+			if st == raft.Shutdown {
+				return
+			}
+			if st == raft.Leader && n.eng.Fatal() != nil {
+				n.stepDown()
+			}
+		}
+	}()
+}
+
+// ensureBarrier runs this term's barrier if it has not run, under reqMu. The
+// context bounds the wait.
+func (n *Node) ensureBarrier(ctx context.Context) error {
+	term := n.raft.CurrentTerm()
+	if !n.needBarrier(term) {
+		return nil
+	}
+	if err := n.barrierFn(ctx); err != nil {
+		return fmt.Errorf("walframe: barrier: %w", err)
+	}
+	n.barrierTerm = term
+	return nil
+}
+
+func (n *Node) barrierFn(ctx context.Context) error {
 	if n.barrier != nil {
 		return n.barrier()
 	}
-	return n.raft.Barrier(n.applyTimeout).Error()
+	f := n.raft.Barrier(n.applyTimeout)
+	done := make(chan error, 1)
+	go func() { done <- f.Error() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-// Query runs read-only statements on this node's committed state.
+// Query runs read-only statements on this node's committed state. On the Leader
+// that state is first brought up to date, as for Execute: a new Leader's FSM may
+// not have applied the log yet.
 func (n *Node) Query(ctx context.Context, req *command.Request) ([]*command.QueryRows, error) {
 	n.reqMu.Lock()
 	defer n.reqMu.Unlock()
+	if n.raft != nil && n.raft.State() == raft.Leader {
+		if err := n.ensureBarrier(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return n.eng.Query(ctx, req, false)
 }
 
@@ -182,7 +245,9 @@ func (n *Node) Apply(l *raft.Log) any {
 		// further apply, no read) until a Restore rebuilds it.
 		n.log.Printf("walframe: cannot apply entry %d: %v", l.Index, err)
 		n.fatalMu.Lock()
-		n.fatal = errors.Join(n.fatal, err)
+		if n.fatal == nil { // the first error is the cause; keeping all would grow without bound
+			n.fatal = err
+		}
 		n.fatalMu.Unlock()
 		n.eng.Fail(err)
 		return err

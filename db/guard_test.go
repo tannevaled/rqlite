@@ -353,3 +353,22 @@ func TestGuardOnARealConnection(t *testing.T) {
 		t.Errorf("guard off again still refuses: %s", e)
 	}
 }
+
+// An ATTACH whose file name is not a literal reaches the authorizer as a NULL
+// pointer; VACUUM's own ATTACH carries the literal ''.
+func TestGuardDeniesNullAttach(t *testing.T) {
+	for _, c := range []struct {
+		mode, op int32
+		z1       uintptr
+		deny     bool
+	}{
+		{guardWrite, sqlite3.SQLITE_ATTACH, 0, true},
+		{guardWrite, sqlite3.SQLITE_ATTACH, 1, false}, // a name: guardDeniesMode judges its text
+		{guardWrite, sqlite3.SQLITE_PRAGMA, 0, false},
+		{guardOff, sqlite3.SQLITE_ATTACH, 0, false},
+	} {
+		if got := guardDeniesNullAttach(c.mode, c.op, c.z1); got != c.deny {
+			t.Errorf("guardDeniesNullAttach(%d, %d, %d) = %v", c.mode, c.op, c.z1, got)
+		}
+	}
+}
