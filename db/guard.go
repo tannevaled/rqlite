@@ -219,9 +219,6 @@ func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, z3, _ uintptr)
 	}
 	// In off mode guardDeniesMode refuses nothing, so there is no separate path.
 	mode := g.mode.Load()
-	if mode == guardOff {
-		return sqlite3.SQLITE_OK
-	}
 	// The hot path: reading is allowed in every guarded mode, and decoding the
 	// arguments of every column read would only cost.
 	switch op {
