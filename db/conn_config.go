@@ -119,6 +119,10 @@ func (c *connector) Driver() driver.Driver {
 	return c.drv
 }
 
+// defensiveOn turns on SQLITE_DBCONFIG_DEFENSIVE; a variable so a test can make
+// it fail, which the real call does only on an out-of-memory error.
+var defensiveOn = func(r rawConn) error { return r.dbConfigDefensive() }
+
 // setExclusiveWAL puts the connection in exclusive locking and WAL mode, and
 // verifies SQLite really is in WAL mode.
 func setExclusiveWAL(ctx context.Context, conn sqlite.ExecQuerierContext) error {
@@ -195,7 +199,7 @@ func buildConnectHook(cfg *ConnConfig) sqlite.ConnectionHookFn {
 
 		if cfg.Guard != nil {
 			raw.installGuard(cfg.Guard)
-			if err := raw.dbConfigDefensive(); err != nil {
+			if err := defensiveOn(raw); err != nil {
 				return fmt.Errorf("cannot enable defensive mode: %w", err)
 			}
 		}

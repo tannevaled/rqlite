@@ -138,10 +138,8 @@ func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, _, _ uintptr) 
 	if g == nil {
 		return sqlite3.SQLITE_OK
 	}
+	// In off mode guardDeniesMode refuses nothing, so there is no separate path.
 	mode := g.mode.Load()
-	if mode == guardOff {
-		return sqlite3.SQLITE_OK
-	}
 	var s1, s2 string
 	// GoString of a NULL pointer is "".
 	switch op {

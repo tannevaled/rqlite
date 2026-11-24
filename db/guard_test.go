@@ -140,8 +140,9 @@ func TestSetExclusiveWAL(t *testing.T) {
 			t.Errorf("pragma %d failing: %v", n, err)
 		}
 	}
-	if err := setExclusiveWAL(ctx, &fakeConn{queryErr: errors.New("q")}); err == nil || !strings.Contains(err.Error(), "cannot enable WAL") {
-		t.Errorf("query failing: %v", err)
+	// Rows are present, so only the error can refuse (nil rows would panic a mutant).
+	if err := setExclusiveWAL(ctx, &fakeConn{queryErr: errors.New("q"), rows: &fakeRows{val: "wal"}}); err == nil || !strings.Contains(err.Error(), "cannot enable WAL") {
+		t.Errorf("query failing with rows: %v", err)
 	}
 	if err := setExclusiveWAL(ctx, &fakeConn{rows: &fakeRows{err: errors.New("r")}}); err == nil || !strings.Contains(err.Error(), "cannot read journal mode") {
 		t.Errorf("row failing: %v", err)
@@ -151,6 +152,29 @@ func TestSetExclusiveWAL(t *testing.T) {
 	}
 	if err := setExclusiveWAL(ctx, &fakeConn{rows: &fakeRows{val: []byte("wal")}}); err == nil {
 		t.Error("a non-string mode was accepted")
+	}
+}
+
+func TestDefensiveFailureRefusesTheConnection(t *testing.T) {
+	old := defensiveOn
+	defer func() { defensiveOn = old }()
+	defensiveOn = func(rawConn) error { return errors.New("no defensive") }
+	var g Guard
+	sc, err := OpenSingleConn(ConnConfig{Guard: &g}, "file:"+filepath.Join(t.TempDir(), "d.db"), nil)
+	if err == nil {
+		sc.Close()
+		t.Fatal("connection opened although DEFENSIVE failed")
+	}
+	if !strings.Contains(err.Error(), "no defensive") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+func TestGuardOffRefusesNothing(t *testing.T) {
+	for _, op := range []int32{sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_CREATE_VTABLE} {
+		if guardDeniesMode(guardOff, op, "sqlite_dbpage", "rtree") {
+			t.Errorf("off mode denies op %d", op)
+		}
 	}
 }
 
