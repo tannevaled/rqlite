@@ -465,7 +465,8 @@ func (e *Engine) checkLocked(pl *PageList) error {
 	if len(pl.Txs) == 0 {
 		return fmt.Errorf("%w: no transaction", ErrRejected)
 	}
-	has1 := e.seq != 0
+	// Before the first entry the database has no pages, so the growth rule below
+	// also makes the first entry carry page 1.
 	pages := e.dbPages
 	for _, tx := range pl.Txs {
 		if len(tx.Pgnos) != len(tx.Pages) || len(tx.Pgnos) == 0 || tx.DBSize == 0 {
@@ -477,9 +478,6 @@ func (e *Engine) checkLocked(pl *PageList) error {
 			}
 			if len(tx.Pages[i]) != int(pl.PageSize) {
 				return fmt.Errorf("%w: page of %d bytes", ErrRejected, len(tx.Pages[i]))
-			}
-			if pg == 1 {
-				has1 = true
 			}
 		}
 		if tx.DBSize > pages {
@@ -507,9 +505,6 @@ func (e *Engine) checkLocked(pl *PageList) error {
 			}
 		}
 		pages = tx.DBSize
-	}
-	if !has1 {
-		return fmt.Errorf("%w: the first entry does not carry page 1", ErrRejected)
 	}
 	return nil
 }
