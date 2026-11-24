@@ -134,13 +134,19 @@ func TestNodeApplyRefusals(t *testing.T) {
 	if got := n.Apply(&raft.Log{Type: raft.LogNoop}); got != nil || n.Fatal() != nil {
 		t.Fatalf("non-command entry: %v, %v", got, n.Fatal())
 	}
+	c.mustExec(req("CREATE TABLE t(x)")) // the WAL now has a page size
+	if got := n.Apply(&raft.Log{Type: raft.LogCommand, Index: 3, Data: marshalCommand([idSize]byte{1}, based(n.eng, &PageList{PageSize: 512,
+		Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{filled(512, 1)}, DBSize: 1}}}))}); !errors.Is(asErr(got), ErrRejected) || n.Fatal() != nil {
+		t.Fatalf("an entry of another page size: %v, fatal %v", got, n.Fatal())
+	}
+	// A rejected entry is not fatal: the node still serves.
+	c.mustExec(req("INSERT INTO t VALUES(1)"))
+	// A garbage entry cannot be vouched for: the node stops.
 	if got := n.Apply(&raft.Log{Type: raft.LogCommand, Data: []byte("garbage")}); got == nil || n.Fatal() == nil {
 		t.Fatalf("garbage entry: %v, %v", got, n.Fatal())
 	}
-	c.mustExec(req("CREATE TABLE t(x)")) // the WAL now has a page size
-	if got := n.Apply(&raft.Log{Type: raft.LogCommand, Index: 3, Data: marshalCommand([idSize]byte{1}, &PageList{PageSize: 512,
-		Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{filled(512, 1)}, DBSize: 1}}})}); got == nil {
-		t.Fatal("an entry of another page size was applied")
+	if _, err := n.Query(bg, req("SELECT 1")); err == nil {
+		t.Fatal("a stopped node served a read")
 	}
 }
 

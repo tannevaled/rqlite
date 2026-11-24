@@ -37,6 +37,13 @@ func (f *faultOps) ReadFile(p string) ([]byte, error) {
 	return osOps{}.ReadFile(p)
 }
 
+func (f *faultOps) ReadRange(p string, off, n int64) ([]byte, error) {
+	if err := f.hit(); err != nil {
+		return nil, err
+	}
+	return osOps{}.ReadRange(p, off, n)
+}
+
 func (f *faultOps) WriteFile(p string, b []byte) error {
 	if err := f.hit(); err != nil {
 		return err
@@ -295,12 +302,12 @@ func TestEngineCommitForeign(t *testing.T) {
 	defer nopanic(t)
 	const ps = 512
 	e := testEngine(t, 1<<30)
-	p1, p5, p2 := filled(ps, 1), filled(ps, 5), filled(ps, 2)
-	pl := &PageList{PageSize: ps, Txs: []Tx{{Pgnos: []uint32{1, 5}, Pages: [][]byte{p1, p5}, DBSize: 1}}}
+	p1, p2 := filled(ps, 1), filled(ps, 2)
+	pl := &PageList{PageSize: ps, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{p1}, DBSize: 1}}}
 	if err := e.Commit([idSize]byte{9}, pl); err != nil {
 		t.Fatal(err)
 	}
-	if st := e.Stats(); st.Applies != 1 || st.Pages != 2 {
+	if st := e.Stats(); st.Applies != 1 || st.Pages != 1 {
 		t.Fatalf("stats %+v", st)
 	}
 	if n, _ := (osOps{}).Size(e.dbPath); n != ps {
@@ -310,14 +317,14 @@ func TestEngineCommitForeign(t *testing.T) {
 	if img := image(t, e); !bytes.Equal(img, p1) {
 		t.Fatalf("image of %d bytes", len(img))
 	}
-	pl2 := &PageList{PageSize: ps, Txs: []Tx{{Pgnos: []uint32{2}, Pages: [][]byte{p2}, DBSize: 2}}}
+	pl2 := based(e, &PageList{PageSize: ps, Txs: []Tx{{Pgnos: []uint32{2}, Pages: [][]byte{p2}, DBSize: 2}}})
 	if err := e.Commit([idSize]byte{10}, pl2); err != nil {
 		t.Fatal(err)
 	}
 	if img := image(t, e); !bytes.Equal(img, append(append([]byte(nil), p1...), p2...)) {
 		t.Fatalf("image of %d bytes", len(img))
 	}
-	if st := e.Stats(); st.Applies != 2 || st.Pages != 3 {
+	if st := e.Stats(); st.Applies != 2 || st.Pages != 2 {
 		t.Fatalf("stats %+v", st)
 	}
 	// The database file is seeded once.
@@ -326,8 +333,8 @@ func TestEngineCommitForeign(t *testing.T) {
 	}
 	// Another page size is refused and changes nothing.
 	end := e.tl.end
-	bad := &PageList{PageSize: 1024, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{filled(1024, 1)}, DBSize: 1}}}
-	if err := e.Commit([idSize]byte{11}, bad); err == nil || !strings.Contains(err.Error(), "does not match") {
+	bad := based(e, &PageList{PageSize: 1024, Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{filled(1024, 1)}, DBSize: 1}}})
+	if err := e.Commit([idSize]byte{11}, bad); !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "page size") {
 		t.Fatalf("page size change: %v", err)
 	}
 	if e.tl.end != end {
@@ -336,7 +343,7 @@ func TestEngineCommitForeign(t *testing.T) {
 	// A page list without page 1 on an empty database seeds nothing.
 	e2 := testEngine(t, 1<<30)
 	no1 := &PageList{PageSize: ps, Txs: []Tx{{Pgnos: []uint32{2}, Pages: [][]byte{p2}, DBSize: 2}}}
-	if err := e2.Commit([idSize]byte{12}, no1); err != nil {
+	if err := e2.Commit([idSize]byte{12}, no1); !errors.Is(err, ErrRejected) {
 		t.Fatal(err)
 	}
 	if n, _ := (osOps{}).Size(e2.dbPath); n != 0 {
@@ -508,6 +515,14 @@ func (c *corruptAfterRun) ReadFile(p string) ([]byte, error) {
 	return c.osOps.ReadFile(p)
 }
 
+// ReadRange serves a header that is not the committed one once armed.
+func (c *corruptAfterRun) ReadRange(p string, off, n int64) ([]byte, error) {
+	if c.armed && strings.HasSuffix(p, "-wal") && off == 0 {
+		return corruptWAL(512)[:walHeaderSize], nil
+	}
+	return c.osOps.ReadRange(p, off, n)
+}
+
 // A WAL that is corrupt only when read back after the request is reported with
 // the request's result and no page list.
 func TestEngineRunReadsACorruptWALAfterTheRequest(t *testing.T) {
@@ -612,7 +627,7 @@ func TestEngineSnapshotAndRestore(t *testing.T) {
 	// A snapshot without a WAL removes the engine's.
 	d := testEngine(t, 1<<30)
 	empty, err := d.snapshotBytes()
-	if err != nil || len(empty) != 8 {
+	if err != nil || len(empty) == 0 {
 		t.Fatalf("empty snapshot: %d bytes, %v", len(empty), err)
 	}
 	if err := f.restoreBytes(empty); err != nil {
@@ -626,27 +641,29 @@ func TestEngineSnapshotAndRestore(t *testing.T) {
 	}
 
 	// Refusals.
-	with := func(n uint64, tail []byte) []byte {
-		return append(append([]byte{0, 0, 0, 0, 0, 0, 0, byte(n)}, filled(int(n), 1)...), tail...)
-	}
+	flipped := append([]byte(nil), snap...)
+	flipped[len(flipped)/2] ^= 1
 	for name, b := range map[string][]byte{
-		"short":        snap[:7],
-		"nil":          nil,
-		"size":         {0, 0, 0, 0, 0, 0, 0, 1},
-		"size by one":  with(3, nil)[:10],
-		"huge size":    {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-		"wal 1 byte":   with(0, []byte{1}),
-		"wal zeros":    with(0, make([]byte, 40)),
-		"wal checksum": with(0, corruptWAL(512)),
+		"short":         snap[:7],
+		"nil":           nil,
+		"truncated":     snap[:len(snap)-1],
+		"bit flip":      flipped,
+		"garbage db":    mkSnap(1, 512, 1, 512, filled(512, 7), nil),
+		"huge size":     mkSnap(1, 512, 1, 1<<40, nil, nil),
+		"seq 0 + data":  mkSnap(0, 0, 0, 3, filled(3, 1), nil),
+		"bad page size": mkSnap(1, 500, 1, 0, nil, nil),
+		"wal 1 byte":    mkSnap(1, 512, 1, 0, nil, []byte{1}),
+		"wal zeros":     mkSnap(1, 512, 1, 0, nil, make([]byte, 40)),
+		"wal checksum":  mkSnap(1, 512, 1, 0, nil, corruptWAL(512)),
 	} {
 		if err := f.restoreBytes(b); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
-	if err := f.restoreBytes(with(3, nil)); err != nil { // the size is exact
-		t.Errorf("exact size refused: %v", err)
+	if err := f.restoreBytes(snap); err != nil {
+		t.Errorf("valid snapshot refused: %v", err)
 	}
-	if err := f.restoreBytes(make([]byte, 8)); err != nil {
+	if err := f.restoreBytes(mkSnap(0, 0, 0, 0, nil, nil)); err != nil {
 		t.Errorf("empty snapshot refused: %v", err)
 	}
 

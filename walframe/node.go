@@ -43,6 +43,8 @@ type Node struct {
 
 	fatalMu sync.Mutex
 	fatal   error
+
+	maxSnapshot int64 // largest snapshot Restore reads; for tests, a variable
 }
 
 // NewNode wraps an Engine.
@@ -50,7 +52,7 @@ func NewNode(e *Engine, logger *log.Logger) *Node {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Node{eng: e, log: logger, applyTimeout: 10 * time.Second}
+	return &Node{eng: e, log: logger, applyTimeout: 10 * time.Second, maxSnapshot: defaultMaxSnapshot}
 }
 
 // Engine returns the node's engine.
@@ -101,6 +103,10 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 		return nil, fmt.Errorf("walframe: entry not committed, local change undone: %w", ferr)
 	}
 	if rerr, ok := f.Response().(error); ok && rerr != nil {
+		if errors.Is(rerr, ErrRejected) {
+			// Nothing was applied anywhere: the client must not see the local result.
+			return nil, rerr
+		}
 		return res, rerr
 	}
 	return res, err
@@ -140,10 +146,19 @@ func (n *Node) Apply(l *raft.Log) any {
 		err = n.eng.Commit(id, pl)
 	}
 	if err != nil {
+		if errors.Is(err, ErrRejected) {
+			// Refused by every node alike, nothing changed: the node carries on and
+			// the Leader that proposed it tells its client.
+			n.log.Printf("walframe: entry %d rejected: %v", l.Index, err)
+			return err
+		}
+		// Anything else: this node cannot vouch for its state. It stops (no
+		// further apply, no read) until a Restore rebuilds it.
 		n.log.Printf("walframe: cannot apply entry %d: %v", l.Index, err)
 		n.fatalMu.Lock()
 		n.fatal = errors.Join(n.fatal, err)
 		n.fatalMu.Unlock()
+		n.eng.Fail(err)
 		return err
 	}
 	return nil
@@ -162,11 +177,20 @@ func (n *Node) Snapshot() (raft.FSMSnapshot, error) {
 // Restore implements raft.FSM.
 func (n *Node) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	b, err := io.ReadAll(io.LimitReader(rc, 1<<32))
+	b, err := io.ReadAll(io.LimitReader(rc, n.maxSnapshot+1))
 	if err != nil {
 		return err
 	}
-	return n.eng.restoreBytes(b)
+	if int64(len(b)) > n.maxSnapshot {
+		return fmt.Errorf("walframe: snapshot larger than %d bytes", n.maxSnapshot)
+	}
+	err = n.eng.restoreBytes(b)
+	if err == nil {
+		n.fatalMu.Lock()
+		n.fatal = nil
+		n.fatalMu.Unlock()
+	}
+	return err
 }
 
 type snap struct{ b []byte }

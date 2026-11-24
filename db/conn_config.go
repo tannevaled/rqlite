@@ -195,6 +195,9 @@ func buildConnectHook(cfg *ConnConfig) sqlite.ConnectionHookFn {
 
 		if cfg.Guard != nil {
 			raw.installGuard(cfg.Guard)
+			if err := raw.dbConfigDefensive(); err != nil {
+				return fmt.Errorf("cannot enable defensive mode: %w", err)
+			}
 		}
 
 		// Foreign key constraints.

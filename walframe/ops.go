@@ -2,7 +2,9 @@ package walframe
 
 import (
 	"errors"
+	"io"
 	"io/fs"
+	"math"
 	"os"
 )
 
@@ -10,7 +12,8 @@ import (
 // file is not an error for the reads, the removal, the truncation and the size:
 // it is the empty state. Tests wrap it to inject failures.
 type fileOps interface {
-	ReadFile(path string) ([]byte, error) // missing: nil, nil
+	ReadFile(path string) ([]byte, error)                // missing: nil, nil
+	ReadRange(path string, off, n int64) ([]byte, error) // n bytes from off (all the rest if n < 0); missing: nil, nil
 	WriteFile(path string, b []byte) error
 	Remove(path string) error                                     // missing: nil
 	Truncate(path string, size int64) error                       // missing: nil
@@ -26,6 +29,25 @@ func (osOps) ReadFile(path string) ([]byte, error) {
 		return nil, nil
 	}
 	return b, err
+}
+
+func (osOps) ReadRange(path string, off, n int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if n < 0 {
+		n = math.MaxInt64 - off
+	}
+	b, err := io.ReadAll(io.NewSectionReader(f, off, n))
+	if err != nil || len(b) == 0 {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (osOps) WriteFile(path string, b []byte) error { return os.WriteFile(path, b, 0o644) }

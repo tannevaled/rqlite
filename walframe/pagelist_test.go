@@ -17,7 +17,8 @@ func seedLists() map[string]*PageList {
 		"two-tx": {PageSize: 512, Txs: []Tx{
 			{Pgnos: []uint32{1, 2}, Pages: [][]byte{pg(1), pg(2)}, DBSize: 2},
 			{Pgnos: []uint32{2}, Pages: [][]byte{pg(3)}, DBSize: 2}}},
-		"empty": {PageSize: 4096},
+		"based": {PageSize: 4096, BaseSeq: 7, BaseHash: [HashSize]byte{1, 2, 3},
+			Txs: []Tx{{Pgnos: []uint32{3}, Pages: [][]byte{bytes.Repeat([]byte{9}, 4096)}, DBSize: 3}}},
 	}
 }
 
@@ -32,7 +33,7 @@ func FuzzUnmarshalPageList(f *testing.F) {
 		f.Add(append(append([]byte{}, b...), 0))
 	}
 	f.Add([]byte{})
-	f.Add([]byte("WFL1"))
+	f.Add([]byte("WFL2"))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		pl, err := UnmarshalPageList(b)
 		if err != nil {
@@ -62,7 +63,7 @@ func TestPageListRoundTripAndRefusals(t *testing.T) {
 		if err != nil {
 			t.Fatal(name, err)
 		}
-		if got.PageSize != pl.PageSize || len(got.Txs) != len(pl.Txs) {
+		if got.PageSize != pl.PageSize || len(got.Txs) != len(pl.Txs) || got.BaseSeq != pl.BaseSeq || got.BaseHash != pl.BaseHash {
 			t.Fatalf("%s: round trip mismatch", name)
 		}
 		if _, err := UnmarshalPageList(append(b, 1)); !errors.Is(err, ErrBadPageList) {
@@ -76,7 +77,7 @@ func TestPageListRoundTripAndRefusals(t *testing.T) {
 		}
 	}
 	// A huge count in a tiny buffer must be refused, not allocated.
-	b := []byte("WFL1\x00\x00\x02\x00\xff\xff\xff\xff")
+	b := plBytes(512, 0xffffffff)
 	if _, err := UnmarshalPageList(b); !errors.Is(err, ErrBadPageList) {
 		t.Errorf("huge tx count accepted: %v", err)
 	}
@@ -94,9 +95,10 @@ func TestWriteSeedCorpus(t *testing.T) {
 	}
 	seeds := map[string][]byte{
 		"empty-input": {},
-		"magic-only":  []byte("WFL1"),
-		"huge-count":  []byte("WFL1\x00\x00\x02\x00\xff\xff\xff\xff"),
-		"zero-pgno":   []byte("WFL1\x00\x00\x02\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00"),
+		"magic-only":  []byte("WFL2"),
+		"huge-count":  plBytes(512, 0xffffffff),
+		"zero-pgno":   plBytes(512, 1, 1, 1, 0),
+		"no-tx":       plBytes(512, 0),
 	}
 	for name, pl := range seedLists() {
 		b, err := MarshalPageList(pl)

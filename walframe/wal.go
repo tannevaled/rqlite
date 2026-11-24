@@ -115,18 +115,57 @@ func scanOrEmpty(b []byte) (walScan, error) {
 	return s, err
 }
 
+// scanTail scans the frames that follow the committed end t of a WAL, without
+// reading what precedes it: region is the file from offset t.end on, and the
+// checksum chain continues from t. It returns the frames up to the last commit
+// frame (absolute offsets), the offset just past it (t.end if there is none)
+// and the tail there.
+func scanTail(region []byte, t tail) ([]frame, int64, tail) {
+	be := binary.BigEndian
+	ps := int64(t.pageSize)
+	fsz := frameHeaderSize + ps
+	c1, c2 := t.c1, t.c2
+	end := t
+	var valid, pending []frame
+	for off := int64(0); off+fsz <= int64(len(region)); off += fsz {
+		fh := region[off : off+frameHeaderSize]
+		if be.Uint32(fh[8:]) != t.salt[0] || be.Uint32(fh[12:]) != t.salt[1] {
+			break
+		}
+		c1, c2 = cksum(t.bigEnd, fh[:8], c1, c2)
+		c1, c2 = cksum(t.bigEnd, region[off+frameHeaderSize:off+fsz], c1, c2)
+		if c1 != be.Uint32(fh[16:]) || c2 != be.Uint32(fh[20:]) {
+			break
+		}
+		f := frame{Offset: t.end + off, Pgno: be.Uint32(fh[0:]), Commit: be.Uint32(fh[4:]), C1: c1, C2: c2}
+		pending = append(pending, f)
+		if f.Commit != 0 {
+			valid = append(valid, pending...)
+			pending = pending[:0]
+			end.end, end.c1, end.c2 = t.end+off+fsz, c1, c2
+		}
+	}
+	return valid, end.end, end
+}
+
 // extractTxs returns the committed transactions found in wal between byte
 // offsets [from, to), to being a commit boundary.
 func extractTxs(wal []byte, s walScan, from, to int64) []Tx {
-	ps := int64(s.Header.PageSize)
+	return extractTxsAt(wal, 0, s.Valid, int64(s.Header.PageSize), from, to)
+}
+
+// extractTxsAt is extractTxs for a buffer that holds the file from offset base
+// on, and for frames already scanned.
+func extractTxsAt(wal []byte, base int64, frames []frame, ps, from, to int64) []Tx {
 	var out []Tx
 	var cur Tx
-	for _, f := range s.Valid {
+	for _, f := range frames {
 		if f.Offset < from || f.Offset >= to {
 			continue
 		}
 		pg := make([]byte, ps)
-		copy(pg, wal[f.Offset+frameHeaderSize:f.Offset+frameHeaderSize+ps])
+		o := f.Offset - base
+		copy(pg, wal[o+frameHeaderSize:o+frameHeaderSize+ps])
 		cur.Pgnos = append(cur.Pgnos, f.Pgno)
 		cur.Pages = append(cur.Pages, pg)
 		if f.Commit != 0 {

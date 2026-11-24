@@ -7,6 +7,7 @@ package walframe
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -447,6 +448,7 @@ func TestTailFromScan(t *testing.T) {
 func plBytes(ps uint32, parts ...uint32) []byte {
 	b := append([]byte(pageListMagic), 0, 0, 0, 0)
 	binary.BigEndian.PutUint32(b[4:], ps)
+	b = append(b, make([]byte, 8+HashSize)...) // base seq and hash
 	for _, p := range parts {
 		b = binary.BigEndian.AppendUint32(b, p)
 	}
@@ -475,10 +477,10 @@ func TestMarshalPageListRefusals(t *testing.T) {
 	if err != nil || !bytes.Equal(b, encodePageList(ok)) {
 		t.Fatalf("MarshalPageList: %v", err)
 	}
-	if want := 12 + 8 + 4 + 512; len(b) != want {
+	if want := pageListHeaderSize + 8 + 4 + 512; len(b) != want {
 		t.Errorf("len = %d, want %d", len(b), want)
 	}
-	if b, err := MarshalPageList(&PageList{PageSize: 512}); err != nil || len(b) != 12 {
+	if b, err := MarshalPageList(&PageList{PageSize: 512}); !errors.Is(err, ErrBadPageList) || b != nil {
 		t.Errorf("empty list: %d, %v", len(b), err)
 	}
 }
@@ -493,8 +495,8 @@ func TestUnmarshalPageListBoundaries(t *testing.T) {
 		ok   bool
 	}{
 		{"nil", nil, false},
-		{"11 bytes", plBytes(512, 0)[:11], false},
-		{"header only, no tx", plBytes(512, 0), true},
+		{"short header", plBytes(512, 1)[:pageListHeaderSize-1], false},
+		{"header only, no tx", plBytes(512, 0), false},
 		{"bad magic", append([]byte("XXXX"), plBytes(512, 0)[4:]...), false},
 		{"bad page size", plBytes(1000, 0), false},
 		{"tx count without data", plBytes(512, 1), false},
@@ -526,12 +528,10 @@ func TestUnmarshalPageListBoundaries(t *testing.T) {
 	in := one()
 	pl, _ = UnmarshalPageList(in)
 	in[len(in)-1] ^= 0xff
-	if pl.Txs[0].Pages[0][511] != 7 {
-		t.Error("decoded page aliases the input")
-	}
-	empty, err := UnmarshalPageList(plBytes(512, 0))
-	if err != nil || empty.PageSize != 512 || len(empty.Txs) != 0 {
-		t.Errorf("empty list: %+v, %v", empty, err)
+	// Decoded pages alias the input (no copy of every page); the engine only
+	// reads them, and the command buffer is not reused.
+	if pl.Txs[0].Pages[0][511] != 7^0xff {
+		t.Error("decoded page does not alias the input")
 	}
 }
 
@@ -559,8 +559,16 @@ func TestCommandCodec(t *testing.T) {
 	if _, _, err := unmarshalCommand(b[:1+idSize]); err == nil || !errors.Is(err, ErrBadPageList) {
 		t.Errorf("17 bytes: %v", err)
 	}
-	// A command header of exactly 17 bytes passes the header test.
-	if _, _, err := unmarshalCommand(append(b[:1+idSize:1+idSize], encodePageList(&PageList{PageSize: 512})...)); err != nil {
+	// A well-checksummed command with an empty page list is refused as a page list.
+	raw := append(append([]byte{cmdPages}, id[:]...), plBytes(512, 0)...)
+	sum := sha256.Sum256(raw)
+	if _, _, err := unmarshalCommand(append(raw, sum[:]...)); !errors.Is(err, ErrBadPageList) {
 		t.Errorf("empty list command: %v", err)
+	}
+	// A flipped bit is a checksum mismatch.
+	flip := append([]byte(nil), b...)
+	flip[len(flip)/2] ^= 1
+	if _, _, err := unmarshalCommand(flip); err == nil || !strings.Contains(err.Error(), "checksum") {
+		t.Errorf("bit flip: %v", err)
 	}
 }
