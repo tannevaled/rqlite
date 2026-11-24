@@ -122,6 +122,9 @@ type Engine struct {
 	// fatal, once set, stops the engine: a failure left the files in a state
 	// this node cannot vouch for, and only a Restore rebuilds them.
 	fatal error
+	// onStop, if set, is called (in its own goroutine) when the engine stops. The
+	// Node uses it to give up Raft leadership: a stopped Leader fails every write.
+	onStop func()
 
 	maxEntry     int64
 	queryTimeout time.Duration
@@ -215,6 +218,11 @@ func (e *Engine) failLocked(err error) {
 	if e.fatal == nil && err != nil {
 		e.fatal = err
 		e.logger.Printf("walframe: engine stopped: %v", err)
+		if e.onStop != nil {
+			// Not under e.mu: the hook talks to Raft, whose FSM goroutine may be
+			// waiting for e.mu.
+			go e.onStop()
+		}
 	}
 }
 
@@ -474,8 +482,29 @@ func (e *Engine) checkLocked(pl *PageList) error {
 				has1 = true
 			}
 		}
-		if uint64(tx.DBSize) > uint64(pages)+uint64(len(tx.Pgnos)) {
-			return fmt.Errorf("%w: database grows from %d to %d pages with %d pages supplied", ErrRejected, pages, tx.DBSize, len(tx.Pgnos))
+		if tx.DBSize > pages {
+			// Every page the database gains must be supplied once. Page numbers
+			// repeat in real commits (a page written twice), so the count is of
+			// DISTINCT new pages: repeating one must not inflate it.
+			seen := make(map[uint32]struct{}, len(tx.Pgnos))
+			for _, pg := range tx.Pgnos {
+				if pg > pages {
+					seen[pg] = struct{}{}
+				}
+			}
+			have := uint64(len(seen))
+			// SQLite never writes the lock-byte page.
+			if lp := lockBytePage(pl.PageSize); lp > pages && lp <= tx.DBSize {
+				if _, ok := seen[lp]; !ok {
+					have++
+				}
+			}
+			if _, ok := seen[1]; pages == 0 && !ok {
+				return fmt.Errorf("%w: the first entry does not carry page 1", ErrRejected)
+			}
+			if have < uint64(tx.DBSize-pages) {
+				return fmt.Errorf("%w: database grows from %d to %d pages with %d new pages supplied", ErrRejected, pages, tx.DBSize, have)
+			}
 		}
 		pages = tx.DBSize
 	}
@@ -483,6 +512,13 @@ func (e *Engine) checkLocked(pl *PageList) error {
 		return fmt.Errorf("%w: the first entry does not carry page 1", ErrRejected)
 	}
 	return nil
+}
+
+// lockBytePage is the number of the page that holds SQLite's lock byte (offset
+// 0x40000000); SQLite never writes it, so a database that grows past it has one
+// page no entry supplies. The page size has been validated by then.
+func lockBytePage(pageSize uint32) uint32 {
+	return uint32(0x40000000/uint64(pageSize)) + 1
 }
 
 // advanceLocked moves the replicated state past an applied entry.
@@ -813,17 +849,18 @@ func parseSnapshot(b []byte) (*snapshotState, error) {
 	if !validPageSize(s.pageSize) || s.dbPages == 0 {
 		return bad("page size %d, %d pages", s.pageSize, s.dbPages)
 	}
-	if len(s.d) > 0 {
-		if len(s.d) < 100 || string(s.d[:16]) != sqliteHeaderMagic {
-			return bad("the database is not a SQLite database")
-		}
-		dps := int64(be.Uint16(s.d[16:]))
-		if dps == 1 {
-			dps = 65536
-		}
-		if dps != ps || int64(len(s.d))%ps != 0 {
-			return bad("the database file does not match the page size %d", ps)
-		}
+	// The database part must hold a database. SQLite deletes a WAL that sits
+	// beside an empty database file, so a snapshot with an empty database part
+	// and a WAL would install as an empty database and pass integrity_check.
+	if len(s.d) < 100 || string(s.d[:16]) != sqliteHeaderMagic {
+		return bad("the database is not a SQLite database (%d bytes)", len(s.d))
+	}
+	dps := int64(be.Uint16(s.d[16:]))
+	if dps == 1 {
+		dps = 65536
+	}
+	if dps != ps || int64(len(s.d))%ps != 0 {
+		return bad("the database file does not match the page size %d", ps)
 	}
 	if len(s.w) > 0 {
 		sc, err := scanWAL(s.w)
@@ -833,9 +870,6 @@ func parseSnapshot(b []byte) (*snapshotState, error) {
 		if int64(sc.Header.PageSize) != ps || sc.CommitEnd != int64(len(s.w)) {
 			return bad("the WAL does not match the page size or is not whole")
 		}
-	}
-	if len(s.d) == 0 && len(s.w) == 0 {
-		return bad("no data for %d applied page lists", s.seq)
 	}
 	return s, nil
 }

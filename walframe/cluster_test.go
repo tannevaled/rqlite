@@ -135,16 +135,20 @@ func (c *cluster) converge(nodes ...*tnode) {
 		nodes = c.nodes
 	}
 	l := c.leaderAmong(nodes)
-	// A barrier makes the Leader's log end the target.
+	// A barrier returns once the Leader's FSM has applied everything logged, so
+	// the Leader's engine state is the target. Raft's AppliedIndex is no witness
+	// for the followers: it moves when a batch is queued to the FSM, not when
+	// the FSM has applied it. The engine's own count of applied entries is.
 	if err := l.r.Barrier(5 * time.Second).Error(); err != nil {
 		c.t.Fatal(err)
 	}
-	want := l.r.LastIndex()
+	want := engSeq(l.n.eng)
 	deadline := time.Now().Add(20 * time.Second)
 	for _, tn := range nodes {
-		for tn.r.AppliedIndex() < want {
+		// A stopped node applies nothing more; its callers read Fatal.
+		for engSeq(tn.n.eng) < want && tn.n.Fatal() == nil {
 			if time.Now().After(deadline) {
-				c.t.Fatalf("node %s applied %d, want %d", tn.id, tn.r.AppliedIndex(), want)
+				c.t.Fatalf("node %s applied %d page lists, want %d", tn.id, engSeq(tn.n.eng), want)
 			}
 			time.Sleep(5 * time.Millisecond)
 		}

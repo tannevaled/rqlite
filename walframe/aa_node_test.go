@@ -35,14 +35,15 @@ func (s *fakeSink) Close() error {
 func (s *fakeSink) ID() string    { return "fake" }
 func (s *fakeSink) Cancel() error { s.canceled = true; return nil }
 
-func TestBehind(t *testing.T) {
+func TestNeedBarrier(t *testing.T) {
 	defer nopanic(t)
+	n := &Node{barrierTerm: 3}
 	for _, c := range []struct {
-		applied, last uint64
-		want          bool
-	}{{1, 2, true}, {2, 2, false}, {3, 2, false}, {0, 1, true}} {
-		if got := behind(c.applied, c.last); got != c.want {
-			t.Errorf("behind(%d, %d) = %v", c.applied, c.last, got)
+		term uint64
+		want bool
+	}{{2, true}, {3, false}, {4, true}} {
+		if got := n.needBarrier(c.term); got != c.want {
+			t.Errorf("needBarrier(%d) = %v", c.term, got)
 		}
 	}
 }
@@ -97,7 +98,7 @@ func TestNodeBarrier(t *testing.T) {
 	if _, err := n.Execute(bg, req("INSERT INTO t VALUES(2)")); err != nil {
 		t.Fatal(err)
 	}
-	if n.behindFn() {
+	if n.needBarrier(n.raft.CurrentTerm()) {
 		t.Error("a quiet leader is behind")
 	}
 	if err := n.barrierFn(); err != nil {

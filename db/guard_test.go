@@ -170,6 +170,91 @@ func TestDefensiveFailureRefusesTheConnection(t *testing.T) {
 	}
 }
 
+func TestGuardDeniesTempAndForeignSchemas(t *testing.T) {
+	for _, op := range []int32{sqlite3.SQLITE_CREATE_TEMP_TABLE, sqlite3.SQLITE_CREATE_TEMP_INDEX,
+		sqlite3.SQLITE_CREATE_TEMP_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_VIEW} {
+		if !guardDeniesMode(guardWrite, op, "x", "") {
+			t.Errorf("write mode allows temp op %d", op)
+		}
+		if guardDeniesMode(guardOff, op, "x", "") {
+			t.Errorf("off mode refuses temp op %d", op)
+		}
+	}
+	for _, c := range []struct {
+		mode int32
+		op   int32
+		z3   string
+		deny bool
+	}{
+		{guardWrite, sqlite3.SQLITE_INSERT, "main", false},
+		{guardWrite, sqlite3.SQLITE_INSERT, "MAIN", false},
+		{guardWrite, sqlite3.SQLITE_INSERT, "temp", true},
+		{guardWrite, sqlite3.SQLITE_UPDATE, "x", true},
+		{guardWrite, sqlite3.SQLITE_DELETE, "x", true},
+		{guardWrite, sqlite3.SQLITE_CREATE_TABLE, "x", true},
+		{guardWrite, sqlite3.SQLITE_CREATE_INDEX, "x", true},
+		{guardWrite, sqlite3.SQLITE_CREATE_TRIGGER, "x", true},
+		{guardWrite, sqlite3.SQLITE_CREATE_VIEW, "x", true},
+		{guardWrite, sqlite3.SQLITE_INSERT, "vacuum_db", false}, // VACUUM's copy
+		{guardWrite, sqlite3.SQLITE_INSERT, "vacuum_1a2b3c4d", false},
+		{guardWrite, sqlite3.SQLITE_INSERT, "", false},
+		{guardWrite, sqlite3.SQLITE_SELECT, "x", false},
+		{guardOff, sqlite3.SQLITE_INSERT, "temp", false},
+		{guardRead, sqlite3.SQLITE_INSERT, "temp", false}, // read mode refuses it elsewhere
+	} {
+		if got := guardDeniesSchema(c.mode, c.op, c.z3); got != c.deny {
+			t.Errorf("guardDeniesSchema(%d, %d, %q) = %v", c.mode, c.op, c.z3, got)
+		}
+	}
+}
+
+func TestGuardRefusesTempAndAttachedPrivateWrites(t *testing.T) {
+	var g Guard
+	sc, err := OpenSingleConn(ConnConfig{Guard: &g}, "file:"+filepath.Join(t.TempDir(), "t.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Close()
+	conn, err := sc.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	run := func(sql string) string {
+		t.Helper()
+		res, err := conn.Request(context.Background(), &command.Request{Statements: []*command.Statement{{Sql: sql}}}, false)
+		if err != nil {
+			return err.Error()
+		}
+		if e := res[0].GetE(); e != nil {
+			return e.Error
+		}
+		if q := res[0].GetQ(); q != nil {
+			return q.Error
+		}
+		return ""
+	}
+	if e := run("CREATE TABLE t(x)"); e != "" {
+		t.Fatal(e)
+	}
+	g.Set(true)
+	for _, s := range []string{
+		"CREATE TEMP TABLE a(x)", "CREATE TEMPORARY TABLE a(x)", "CREATE TEMP TABLE a AS SELECT 1",
+		"CREATE TEMP VIEW v AS SELECT 1", "CREATE TABLE temp.a(x)",
+		"CREATE TEMP TRIGGER g AFTER INSERT ON t BEGIN SELECT 1; END",
+		"ATTACH '' AS p; CREATE TABLE p.a(x)",
+	} {
+		if e := run(s); !strings.Contains(e, "not authorized") {
+			t.Errorf("%q: %q", s, e)
+		}
+	}
+	for _, s := range []string{"INSERT INTO t VALUES(1)", "UPDATE t SET x=2", "VACUUM", "CREATE INDEX i ON t(x)", "DELETE FROM t"} {
+		if e := run(s); e != "" {
+			t.Errorf("%q refused: %s", s, e)
+		}
+	}
+}
+
 func TestGuardOffRefusesNothing(t *testing.T) {
 	for _, op := range []int32{sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_CREATE_VTABLE} {
 		if guardDeniesMode(guardOff, op, "sqlite_dbpage", "rtree") {

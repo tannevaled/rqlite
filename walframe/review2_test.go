@@ -74,10 +74,10 @@ func TestParseSnapshotRefusals(t *testing.T) {
 		{"tiny database", mkSnap(sd.seq, 4096, 1, 50, zeros(50), nil), "not a SQLite"},
 		{"database page size", mkSnap(sd.seq, 512, sd.dbPages, uint64(len(sd.d)), sd.d, nil), "does not match the page size"},
 		{"database length", mkSnap(sd.seq, 4096, sd.dbPages, uint64(len(sd.d)-1), sd.d[:len(sd.d)-1], nil), "does not match the page size"},
-		{"WAL garbage", mkSnap(sw.seq, 4096, sw.dbPages, 0, nil, zeros(40)), "WAL:"},
-		{"WAL not whole", mkSnap(sw.seq, 4096, sw.dbPages, 0, nil, extra), "not whole"},
-		{"WAL page size", mkSnap(sw.seq, 512, sw.dbPages, 0, nil, sw.w), "does not match"},
-		{"no data", mkSnap(sw.seq, 4096, 1, 0, nil, nil), "no data"},
+		{"WAL garbage", mkSnap(sw.seq, 4096, sw.dbPages, uint64(len(sd.d)), sd.d, zeros(40)), "WAL:"},
+		{"WAL not whole", mkSnap(sw.seq, 4096, sw.dbPages, uint64(len(sd.d)), sd.d, extra), "not whole"},
+		{"WAL page size", mkSnap(sw.seq, 512, sw.dbPages, uint64(len(sd.d)), sd.d, sw.w), "does not match"},
+		{"no data", mkSnap(sw.seq, 4096, 1, 0, nil, nil), "not a SQLite"},
 	} {
 		_, err := parseSnapshot(c.snap)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
@@ -85,7 +85,7 @@ func TestParseSnapshotRefusals(t *testing.T) {
 		}
 	}
 	for name, s := range map[string][]byte{
-		"WAL":      mkSnap(sw.seq, 4096, sw.dbPages, 0, nil, sw.w),
+		"WAL":      mkSnap(sw.seq, 4096, sw.dbPages, uint64(len(sd.d)), sd.d, sw.w),
 		"database": mkSnap(sd.seq, 4096, sd.dbPages, uint64(len(sd.d)), sd.d, nil),
 		"empty":    mkSnap(0, 0, 0, 0, nil, nil),
 	} {

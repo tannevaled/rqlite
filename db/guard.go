@@ -113,7 +113,32 @@ func guardDeniesMode(mode, op int32, z1, z2 string) bool {
 		case sqlite3.SQLITE_CREATE_VTABLE:
 			_, ok := vtabModules[strings.ToLower(z2)]
 			return !ok
+		case sqlite3.SQLITE_CREATE_TEMP_TABLE, sqlite3.SQLITE_CREATE_TEMP_INDEX,
+			sqlite3.SQLITE_CREATE_TEMP_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_VIEW:
+			// Nothing in the temp schema is a page of the replicated database: it
+			// would exist on the Leader only.
+			return true
 		}
+	}
+	return false
+}
+
+// guardDeniesSchema reports whether the write-mode guard refuses an action that
+// changes a database other than "main": z3, the authorizer's third argument, names
+// it. The temp schema and the private database of ATTACH ” (let through for
+// VACUUM) are not replicated, so a write there would exist on the Leader only.
+func guardDeniesSchema(mode, op int32, z3 string) bool {
+	if mode != guardWrite {
+		return false
+	}
+	switch op {
+	case sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+		sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_INDEX,
+		sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_VIEW:
+		// VACUUM copies into the private database it ATTACHes as vacuum_<hex> (vacuum_db in older SQLite), with
+		// the authorizer still on. A user can name an ATTACH '' that too: a known
+		// limit, as for ATTACH '' itself.
+		return z3 != "" && !strings.EqualFold(z3, "main") && !strings.HasPrefix(strings.ToLower(z3), "vacuum_")
 	}
 	return false
 }
@@ -131,7 +156,7 @@ func (r rawConn) installGuard(g *Guard) {
 	sqlite3.Xsqlite3_set_authorizer(r.tls, r.db, cFuncPointer(guardCallback), r.db)
 }
 
-func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, _, _ uintptr) int32 {
+func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, z3, _ uintptr) int32 {
 	guards.RLock()
 	g := guards.m[pArg]
 	guards.RUnlock()
@@ -149,6 +174,9 @@ func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, _, _ uintptr) 
 		s1, s2 = libc.GoString(z1), libc.GoString(z2)
 	}
 	if guardDeniesMode(mode, op, s1, s2) {
+		return sqlite3.SQLITE_DENY
+	}
+	if z3 != 0 && guardDeniesSchema(mode, op, libc.GoString(z3)) {
 		return sqlite3.SQLITE_DENY
 	}
 	return sqlite3.SQLITE_OK

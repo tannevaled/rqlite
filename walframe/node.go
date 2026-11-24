@@ -40,6 +40,9 @@ type Node struct {
 	// not reproducible on demand.
 	behind  func() bool
 	barrier func() error
+	// barrierTerm is the Raft term in which this node last ran its barrier
+	// (under reqMu); terms start at 1.
+	barrierTerm uint64
 
 	fatalMu sync.Mutex
 	fatal   error
@@ -52,7 +55,11 @@ func NewNode(e *Engine, logger *log.Logger) *Node {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Node{eng: e, log: logger, applyTimeout: 10 * time.Second, maxSnapshot: defaultMaxSnapshot}
+	n := &Node{eng: e, log: logger, applyTimeout: 10 * time.Second, maxSnapshot: defaultMaxSnapshot}
+	e.mu.Lock()
+	e.onStop = n.stepDown
+	e.mu.Unlock()
+	return n
 }
 
 // Engine returns the node's engine.
@@ -82,11 +89,18 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 		return nil, ErrNotLeader
 	}
 	// A new Leader must have applied every entry of previous terms before it
-	// runs anything against its database.
-	if n.behindFn() {
+	// runs anything against its database. Raft's AppliedIndex cannot say so: it
+	// moves when a batch is queued to the FSM goroutine, not when the FSM has
+	// applied it (hashicorp/raft v1.8.0 raft.go:1362). A Barrier, whose future
+	// answers after the FSM has applied everything before it, can, and within one
+	// term every later entry is this node's own, applied before its request
+	// returns. So: once per term.
+	term := n.raft.CurrentTerm()
+	if n.needBarrier(term) {
 		if err := n.barrierFn(); err != nil {
 			return nil, fmt.Errorf("walframe: barrier: %w", err)
 		}
+		n.barrierTerm = term
 	}
 	res, pl, id, err := n.eng.Run(ctx, req, false)
 	if pl == nil {
@@ -112,14 +126,26 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 	return res, err
 }
 
-// behind reports whether the log holds entries this node has not applied.
-func behind(applied, last uint64) bool { return applied < last }
-
-func (n *Node) behindFn() bool {
+// needBarrier reports whether this Leader has yet to run its barrier in term.
+func (n *Node) needBarrier(term uint64) bool {
 	if n.behind != nil {
 		return n.behind()
 	}
-	return behind(n.raft.AppliedIndex(), n.raft.LastIndex())
+	return term != n.barrierTerm
+}
+
+// stepDown gives up Raft leadership: a Leader whose engine stopped would fail
+// every write and keep the cluster from electing a healthy one. It cannot help
+// a single-node cluster, and a stopped node may be elected again later, when it
+// steps down again.
+func (n *Node) stepDown() {
+	r := n.raft
+	if r == nil || r.State() != raft.Leader {
+		return
+	}
+	if err := r.LeadershipTransfer().Error(); err != nil {
+		n.log.Printf("walframe: stopped, and cannot give up leadership: %v", err)
+	}
 }
 
 func (n *Node) barrierFn() error {
