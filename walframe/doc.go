@@ -43,19 +43,45 @@
 //
 // Statements go through a SQLite authorizer (db.Guard) at prepare time, so
 // comments, spacing, case and multi-statement strings cannot get past it.
-// Write mode refuses ATTACH/DETACH, writes to sqlite_dbpage and every PRAGMA
-// not on an allowlist (an allowlist, not a denylist); virtual table modules
-// are allowlisted; SQLITE_DBCONFIG_DEFENSIVE is on. Read mode (Query, on every
-// node) allows only SELECT, READ, FUNCTION, RECURSIVE and allowlisted
-// pragmas: BEGIN, DML, DDL, SAVEPOINT and query_only are refused, queries run
-// under a timeout (SetQueryTimeout) and roll back any open transaction.
+// Write mode is an allowlist that denies by default: SELECT, READ, FUNCTION,
+// RECURSIVE, TRANSACTION and SAVEPOINT, and on schema main only INSERT, UPDATE,
+// DELETE, CREATE and DROP of TABLE, INDEX, TRIGGER and VIEW, DROP_VTABLE,
+// REINDEX, ANALYZE, ALTER_TABLE, the pragmas user_version, application_id and
+// optimize, and CREATE VIRTUAL TABLE for fts3/fts4/fts5. Every action that names
+// a schema is checked against it, so temp, an attached database or a
+// vacuum_* name is refused; so are COPY, DETACH, writes to sqlite_dbpage and
+// any action code not listed (including one a later SQLite adds). A client's SQL
+// never gets ATTACH: the one ATTACH ” that VACUUM needs is let through only
+// while the engine runs a statement it recognised as exactly one plain VACUUM
+// (Guard.SetVacuum), and the vacuum_* schema names are accepted only then.
+// SQLITE_DBCONFIG_DEFENSIVE is on. Read mode (on every node) allows only SELECT,
+// READ, FUNCTION, RECURSIVE and the read-only pragmas: BEGIN, DML, DDL,
+// SAVEPOINT and query_only are refused, queries run under a timeout
+// (SetQueryTimeout, which bounds Run as well) and roll back any open
+// transaction.
+//
+// # Read consistency
+//
+// Node.QueryLevel mirrors rqlite's levels. None reads this node's state, on any
+// node, and may be stale. Weak requires the node to be the Raft Leader and to
+// have run its barrier in this term; Raft steps a Leader down after
+// LeaderLeaseTimeout without a quorum, so a Weak read can be stale for at most
+// about that long. Linearizable (the zero value, and the level of Node.Query)
+// also asks Raft to verify leadership with a quorum before reading. A read-only
+// request sent through Execute is checked like a Linearizable read. There is no
+// "strong" level: writes already go through the log. One barrier is shared by all
+// the requests of a term, even when some of them give up waiting for it.
 //
 // # Failure states
 //
 // An entry the FSM refuses (ErrRejected: stale base, bad page size, bad DBSize,
-// bit flip, empty list, first entry without page 1) is deterministic and not
-// fatal. Any other apply error stops the node (Node.Apply returns it, the
-// engine is ErrStopped) until Restore installs a snapshot. Snapshots are
+// bit flip, empty list, first entry without page 1, and bytes that do not decode
+// at all) is deterministic and not fatal: it decodes the same on every node and
+// changes nothing. Any other apply error stops the node (Node.Apply returns it,
+// the engine is ErrStopped) until Restore installs a snapshot. A stopped Leader
+// hands the leadership over, at most stepDownBudget times (with a growing pause
+// between handovers) until a Restore: a cluster whose nodes all stopped waits
+// for an operator and does not elect in a loop. Snapshots are
 // validated before anything is installed: checksum, SQLite header, WAL scan,
 // and integrity_check on a scratch copy.
 //
@@ -69,8 +95,8 @@
 // # Limits
 //
 // No restart persistence (state is rebuilt from the Raft snapshot and log); no
-// concurrent readers; snapshots are built in memory; temp and ” databases are
-// Leader-only (not replicated, so statements using them diverge); a read can
+// concurrent readers; snapshots are built in memory; a single-node cluster cannot step
+// down; a request waiting for the request mutex ignores its context; a read can
 // delay the FSM at most by the query timeout; the DBSize growth rule is
 // conservative; an entry whose future failed may still commit through a new
 // Leader. A 1 MB update still allocates about 15.6 MB/op across a 3-node

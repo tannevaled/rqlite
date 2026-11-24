@@ -9,20 +9,25 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Guard is a SQLite authorizer for a connection of a SingleConn. It has three
+// Guard is a SQLite authorizer for a connection of a SingleConn. It has four
 // modes:
 //
 //   - off: the owner runs its own statements (a checkpoint is a PRAGMA).
-//   - write (Set(true)): a user request that may write. ATTACH, DETACH, every
-//     PRAGMA not on an allowlist, writes to sqlite_dbpage and virtual-table
-//     modules not on an allowlist are refused.
+//   - write (Set(true)): a user request that may write. An ALLOWLIST: only the
+//     action codes in writeActions are let through, on the schema "main" alone;
+//     every other code, known or not yet invented, is refused. A user can never
+//     ATTACH or DETACH.
+//   - vacuum (SetVacuum(true)): write mode, plus the ATTACH of a private empty
+//     database and the schema vacuum_* that SQLite's own VACUUM uses. Only the
+//     engine selects it, around a statement it has recognised as a plain
+//     VACUUM; no SQL a client sends can reach it.
 //   - read (SetReadOnly(true)): a user read. Only SELECT-class actions are
 //     allowed: every write, BEGIN, SAVEPOINT, DDL, ATTACH and every PRAGMA
 //     outside the read-only allowlist is refused.
 //
 // The authorizer runs inside SQLite at prepare time, so comments, spacing, case
-// and multi-statement strings cannot get past it, unlike a text match. The
-// pragma lists are ALLOWLISTS: a pragma nobody thought of is refused.
+// and multi-statement strings cannot get past it, unlike a text match. Every list
+// here is an ALLOWLIST: what nobody thought of is refused.
 type Guard struct {
 	mode atomic.Int32
 }
@@ -31,12 +36,24 @@ const (
 	guardOff int32 = iota
 	guardWrite
 	guardRead
+	guardVacuum
 )
 
 // Set turns the write-mode guard on or off.
 func (g *Guard) Set(on bool) {
 	if on {
 		g.mode.Store(guardWrite)
+	} else {
+		g.mode.Store(guardOff)
+	}
+}
+
+// SetVacuum turns the vacuum-mode guard on or off. It is for the engine's own
+// plain VACUUM and must never be selected for a statement a client wrote beyond
+// that one word.
+func (g *Guard) SetVacuum(on bool) {
+	if on {
+		g.mode.Store(guardVacuum)
 	} else {
 		g.mode.Store(guardOff)
 	}
@@ -69,24 +86,50 @@ var writePragmas = map[string]struct{}{
 }
 
 // vtabModules are the virtual-table modules a user may create: their shadow
-// tables are ordinary tables in the replicated pages.
+// tables are ordinary tables in the replicated pages. FTS3 is not compiled into
+// this build, so only fts4 and fts5 can exist; fts3 is listed for a build that
+// has it.
 var vtabModules = map[string]struct{}{"fts3": {}, "fts4": {}, "fts5": {}}
 
-// guardDenies is guardDeniesMode for the write mode, without a second argument.
-func guardDenies(op int32, z1 string) bool { return guardDeniesMode(guardWrite, op, z1, "") }
-
-// guardDeniesMode reports whether the guard refuses an authorizer action. z1
-// and z2 are the action's first two arguments: for PRAGMA the pragma's name,
-// for ATTACH the file name, for CREATE_VTABLE the table and the module, for a
-// write the table.
+// Action classes of the write allowlist.
 //
-// VACUUM attaches a private temporary database, with an empty file name, and
-// SQLite offers that to the authorizer; it is the one ATTACH let through in
-// write mode (SQLite gives ATTACH no second argument to tell them apart). A user
-// can spell it too, ATTACH ” AS x: a private, empty, per-connection database
-// that is not replicated. Data put there exists on the Leader only, so
-// statements that use it would diverge; this is a known limit of the prototype.
-func guardDeniesMode(mode, op int32, z1, z2 string) bool {
+//   - freeActions touch no schema: they read, or they name a transaction.
+//   - schemaActions change or inspect a database named by the authorizer's
+//     third argument; they are let through on "main" only.
+//
+// Everything else is refused: COPY, the CREATE_TEMP_* and DROP_TEMP_* codes
+// (nothing in the temp schema is a replicated page), ATTACH, DETACH, and any
+// code SQLite adds later. ALTER_TABLE, PRAGMA, CREATE_VTABLE and ATTACH are
+// handled by name in guardDeniesMode because their arguments differ.
+var freeActions = map[int32]struct{}{
+	sqlite3.SQLITE_SELECT: {}, sqlite3.SQLITE_READ: {}, sqlite3.SQLITE_FUNCTION: {},
+	sqlite3.SQLITE_RECURSIVE: {}, sqlite3.SQLITE_TRANSACTION: {}, sqlite3.SQLITE_SAVEPOINT: {},
+}
+
+var schemaActions = map[int32]struct{}{
+	sqlite3.SQLITE_INSERT: {}, sqlite3.SQLITE_UPDATE: {}, sqlite3.SQLITE_DELETE: {},
+	sqlite3.SQLITE_CREATE_TABLE: {}, sqlite3.SQLITE_CREATE_INDEX: {},
+	sqlite3.SQLITE_CREATE_TRIGGER: {}, sqlite3.SQLITE_CREATE_VIEW: {},
+	sqlite3.SQLITE_DROP_TABLE: {}, sqlite3.SQLITE_DROP_INDEX: {},
+	sqlite3.SQLITE_DROP_TRIGGER: {}, sqlite3.SQLITE_DROP_VIEW: {},
+	sqlite3.SQLITE_REINDEX: {}, sqlite3.SQLITE_ANALYZE: {}, sqlite3.SQLITE_DROP_VTABLE: {},
+}
+
+// guardDenies is guardDeniesMode for the write mode on an unqualified name.
+func guardDenies(op int32, z1 string) bool { return guardDeniesMode(guardWrite, op, z1, "", "") }
+
+// guardDeniesMode reports whether the guard refuses an authorizer action. z1,
+// z2 and z3 are the action's first three arguments: for PRAGMA the pragma's
+// name, its argument and the schema; for ATTACH the file name; for ALTER_TABLE
+// the schema and the table; for CREATE_VTABLE the table, the module and the
+// schema; for a write the table, nothing and the schema.
+//
+// VACUUM attaches a private empty database, with the literal name ”, and
+// copies into it; SQLite offers that to the authorizer, with nothing to tell it
+// from a client's own ATTACH ”. So a client's ATTACH is refused in every
+// guarded mode but vacuum, which the engine selects for a plain VACUUM it has
+// recognised itself.
+func guardDeniesMode(mode, op int32, z1, z2, z3 string) bool {
 	switch mode {
 	case guardRead:
 		switch op {
@@ -97,30 +140,51 @@ func guardDeniesMode(mode, op int32, z1, z2 string) bool {
 			return !ok
 		}
 		return true
-	case guardWrite:
-		switch op {
-		case sqlite3.SQLITE_ATTACH:
-			return z1 != ""
-		case sqlite3.SQLITE_DETACH:
-			return true
-		case sqlite3.SQLITE_PRAGMA:
-			n := strings.ToLower(z1)
-			_, r := readPragmas[n]
-			_, w := writePragmas[n]
-			return !r && !w
-		case sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE:
-			return strings.EqualFold(z1, "sqlite_dbpage")
-		case sqlite3.SQLITE_CREATE_VTABLE:
-			_, ok := vtabModules[strings.ToLower(z2)]
-			return !ok
-		case sqlite3.SQLITE_CREATE_TEMP_TABLE, sqlite3.SQLITE_CREATE_TEMP_INDEX,
-			sqlite3.SQLITE_CREATE_TEMP_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_VIEW:
-			// Nothing in the temp schema is a page of the replicated database: it
-			// would exist on the Leader only.
+	case guardWrite, guardVacuum:
+		return guardDeniesWrite(mode == guardVacuum, op, z1, z2, z3)
+	}
+	return false
+}
+
+// guardDeniesWrite is the write allowlist; vacuum adds VACUUM's own needs.
+func guardDeniesWrite(vacuum bool, op int32, z1, z2, z3 string) bool {
+	if _, ok := freeActions[op]; ok {
+		return false
+	}
+	switch op {
+	case sqlite3.SQLITE_ATTACH:
+		return !vacuum || z1 != ""
+	case sqlite3.SQLITE_ALTER_TABLE:
+		return deniedSchema(vacuum, z1)
+	case sqlite3.SQLITE_PRAGMA:
+		n := strings.ToLower(z1)
+		_, r := readPragmas[n]
+		_, w := writePragmas[n]
+		return (!r && !w) || deniedSchema(vacuum, z3)
+	case sqlite3.SQLITE_CREATE_VTABLE:
+		_, ok := vtabModules[strings.ToLower(z2)]
+		return !ok || deniedSchema(vacuum, z3)
+	}
+	if _, ok := schemaActions[op]; !ok {
+		return true // DETACH, COPY, every temp action, and any code not listed
+	}
+	switch op {
+	case sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE:
+		if strings.EqualFold(z1, "sqlite_dbpage") {
 			return true
 		}
 	}
-	return false
+	return deniedSchema(vacuum, z3)
+}
+
+// deniedSchema reports whether a write to schema s is refused: only "main" is
+// replicated. An empty name is main. VACUUM's private copy, vacuum_<hex> (vacuum_db
+// in older SQLite), exists only while the engine's own VACUUM runs.
+func deniedSchema(vacuum bool, s string) bool {
+	if s == "" || strings.EqualFold(s, "main") {
+		return false
+	}
+	return !(vacuum && strings.HasPrefix(strings.ToLower(s), "vacuum_"))
 }
 
 // guardDeniesNullAttach reports whether the guard refuses an ATTACH whose file
@@ -128,29 +192,9 @@ func guardDeniesMode(mode, op int32, z1, z2 string) bool {
 // when it is a string LITERAL (VACUUM's own ATTACH is the literal ”); an
 // expression ('p' || ”), a bound parameter or any computed name arrives as NULL,
 // which GoString turns into "" and would pass for VACUUM's. Such a name can open
-// any file, so a NULL is always refused.
+// any file, so a NULL is always refused in the guarded write modes.
 func guardDeniesNullAttach(mode, op int32, z1 uintptr) bool {
-	return mode == guardWrite && op == sqlite3.SQLITE_ATTACH && z1 == 0
-}
-
-// guardDeniesSchema reports whether the write-mode guard refuses an action that
-// changes a database other than "main": z3, the authorizer's third argument, names
-// it. The temp schema and the private database of ATTACH ” (let through for
-// VACUUM) are not replicated, so a write there would exist on the Leader only.
-func guardDeniesSchema(mode, op int32, z3 string) bool {
-	if mode != guardWrite {
-		return false
-	}
-	switch op {
-	case sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
-		sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_INDEX,
-		sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_VIEW:
-		// VACUUM copies into the private database it ATTACHes as vacuum_<hex> (vacuum_db in older SQLite), with
-		// the authorizer still on. A user can name an ATTACH '' that too: a known
-		// limit, as for ATTACH '' itself.
-		return z3 != "" && !strings.EqualFold(z3, "main") && !strings.HasPrefix(strings.ToLower(z3), "vacuum_")
-	}
-	return false
+	return (mode == guardWrite || mode == guardVacuum) && op == sqlite3.SQLITE_ATTACH && z1 == 0
 }
 
 var guards = struct {
@@ -175,18 +219,18 @@ func guardCallback(tls *libc.TLS, pArg uintptr, op int32, z1, z2, z3, _ uintptr)
 	}
 	// In off mode guardDeniesMode refuses nothing, so there is no separate path.
 	mode := g.mode.Load()
-	var s1, s2 string
-	// GoString of a NULL pointer is "".
+	if mode == guardOff {
+		return sqlite3.SQLITE_OK
+	}
+	// The hot path: reading is allowed in every guarded mode, and decoding the
+	// arguments of every column read would only cost.
 	switch op {
-	case sqlite3.SQLITE_PRAGMA, sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE:
-		s1 = libc.GoString(z1)
-	case sqlite3.SQLITE_CREATE_VTABLE:
-		s1, s2 = libc.GoString(z1), libc.GoString(z2)
+	case sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE:
+		return sqlite3.SQLITE_OK
 	}
-	if guardDeniesNullAttach(mode, op, z1) || guardDeniesMode(mode, op, s1, s2) {
-		return sqlite3.SQLITE_DENY
-	}
-	if z3 != 0 && guardDeniesSchema(mode, op, libc.GoString(z3)) {
+	// GoString of a NULL pointer is "".
+	if guardDeniesNullAttach(mode, op, z1) ||
+		guardDeniesMode(mode, op, libc.GoString(z1), libc.GoString(z2), libc.GoString(z3)) {
 		return sqlite3.SQLITE_DENY
 	}
 	return sqlite3.SQLITE_OK

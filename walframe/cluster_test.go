@@ -157,7 +157,7 @@ func (c *cluster) converge(nodes ...*tnode) {
 
 func (c *cluster) integrity(tn *tnode) string {
 	c.t.Helper()
-	rows, err := tn.n.Query(context.Background(), req("PRAGMA integrity_check"))
+	rows, err := tn.n.QueryLevel(context.Background(), req("PRAGMA integrity_check"), None)
 	if err != nil || len(rows) != 1 || rows[0].Error != "" {
 		c.t.Fatalf("integrity_check on %s: %v %v", tn.id, rows, err)
 	}
@@ -166,7 +166,7 @@ func (c *cluster) integrity(tn *tnode) string {
 
 func (c *cluster) rows(tn *tnode, q string) string {
 	c.t.Helper()
-	rows, err := tn.n.Query(context.Background(), req(q))
+	rows, err := tn.n.QueryLevel(context.Background(), req(q), None)
 	if err != nil || len(rows) != 1 {
 		c.t.Fatalf("%s on %s: %v %v", q, tn.id, rows, err)
 	}

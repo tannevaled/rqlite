@@ -236,19 +236,24 @@ func TestSnapshotHeaderFieldsAreValidated(t *testing.T) {
 // F-R3-4: Node.fatal keeps the first error, not every one joined.
 func TestFatalKeepsOnlyTheFirstError(t *testing.T) {
 	n := NewNode(testEngine(t, 0), nil)
-	n.Apply(&raft.Log{Type: raft.LogCommand, Index: 1, Data: []byte("garbage one")})
+	// A well-formed entry reaching an engine that has stopped is an apply this node
+	// cannot vouch for: it is the case that sets fatal.
+	n.eng.Fail(errInjected)
+	cmd := marshalCommand([idSize]byte{1}, &PageList{PageSize: 4096,
+		Txs: []Tx{{Pgnos: []uint32{1}, Pages: [][]byte{filled(4096, 1)}, DBSize: 1}}})
+	n.Apply(&raft.Log{Type: raft.LogCommand, Index: 1, Data: cmd})
 	first := n.Fatal()
 	if first == nil {
-		t.Fatal("a refused entry did not stop the node")
+		t.Fatal("a failed apply did not stop the node")
 	}
 	for i := 2; i < 50; i++ {
-		n.Apply(&raft.Log{Type: raft.LogCommand, Index: uint64(i), Data: []byte("garbage")})
+		n.Apply(&raft.Log{Type: raft.LogCommand, Index: uint64(i), Data: cmd})
 	}
 	if n.Fatal() != first {
 		t.Errorf("fatal changed or grew: %v", n.Fatal())
 	}
-	if _, joined := n.Fatal().(interface{ Unwrap() []error }); joined {
-		t.Errorf("fatal is a joined error: %v", n.Fatal())
+	if got := n.Fatal().Error(); got != first.Error() || strings.Count(got, "injected failure") != 1 {
+		t.Errorf("fatal grew: %v", got)
 	}
 }
 

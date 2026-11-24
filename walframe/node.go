@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -40,13 +41,28 @@ type Node struct {
 	// not reproducible on demand.
 	behind  func() bool
 	barrier func() error
-	// barrierTerm is the Raft term in which this node last ran its barrier
-	// (under reqMu); terms start at 1.
+	// bmu guards barrierTerm and pending: a barrier runs in a goroutine of its own,
+	// which outlives a request that gave up waiting for it.
+	bmu sync.Mutex
+	// barrierTerm is the Raft term in which this node last ran its barrier to
+	// completion; terms start at 1.
 	barrierTerm uint64
+	// pending is the barrier in flight, if any: every request of the term waits
+	// for that one instead of appending a Barrier entry of its own.
+	pending *barrierRun
+	// verify, if set, replaces raft's VerifyLeader. For tests.
+	verify func() error
 	// transfer, if set, replaces the leadership transfer; watchDone is closed when
 	// the goroutine watching Raft's state returns (at Raft's shutdown). For tests.
-	transfer  func() error
-	watchDone chan struct{}
+	// backoff, if non-zero, replaces stepDownBackoff; backoffMax replaces
+	// stepDownBackoffMax.
+	transfer   func() error
+	watchDone  chan struct{}
+	backoff    time.Duration
+	backoffMax time.Duration
+	// transfers counts the leadership transfers a stopped node has made since it
+	// last was rebuilt.
+	transfers atomic.Int32
 
 	fatalMu sync.Mutex
 	fatal   error
@@ -107,6 +123,14 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 	}
 	res, pl, id, err := n.eng.Run(ctx, req, false)
 	if pl == nil {
+		// Nothing to replicate: the request may still have READ, and what it read
+		// is only as good as this node's leadership. Prove it, as a linearizable
+		// Query does, before the client sees it.
+		if err == nil && len(res) > 0 {
+			if verr := n.verifyLeader(ctx); verr != nil {
+				return nil, verr
+			}
+		}
 		return res, err
 	}
 	if n.afterLocalExec != nil {
@@ -134,6 +158,8 @@ func (n *Node) needBarrier(term uint64) bool {
 	if n.behind != nil {
 		return n.behind()
 	}
+	n.bmu.Lock()
+	defer n.bmu.Unlock()
 	return term != n.barrierTerm
 }
 
@@ -149,6 +175,7 @@ func (n *Node) stepDown() {
 			return
 		}
 		if err = n.transferFn(r); err == nil {
+			n.transfers.Add(1)
 			return
 		}
 		time.Sleep(stepDownPause)
@@ -165,10 +192,57 @@ func (n *Node) transferFn(r *raft.Raft) error {
 }
 
 // A failed transfer (no peer ready, an election in progress) is retried.
+//
+// The transfers themselves are bounded, because a node cannot tell a healthy
+// peer from a stopped one: when every node is stopped, each hands the
+// leadership to another that does the same, and every handover costs a term, a
+// write to the stable store and a log entry on every node. After a transfer
+// the next one waits stepDownBackoff, then twice that, and so on; and a node
+// gives up after stepDownBudget successful transfers since it was last rebuilt
+// (Restore): it stays Leader, refusing everything (a stopped engine serves
+// nothing), and says so in the log. That is a cluster waiting for an operator,
+// not one that churns.
 const (
-	stepDownTries = 5
-	stepDownPause = 100 * time.Millisecond
+	stepDownTries      = 5
+	stepDownPause      = 100 * time.Millisecond
+	stepDownBudget     = 3
+	stepDownBackoff    = time.Second
+	stepDownBackoffMax = 30 * time.Second
 )
+
+// backoffBefore is the wait before the next transfer, given that done have
+// already been made: none for the first, then doubling from the base.
+func (n *Node) backoffBefore(done int32) time.Duration {
+	if done <= 0 {
+		return 0
+	}
+	base, max := n.backoff, n.backoffMax
+	if base == 0 {
+		base = stepDownBackoff
+	}
+	if max == 0 {
+		max = stepDownBackoffMax
+	}
+	d := base
+	for i := int32(1); i < done && d < max; i++ {
+		d *= 2
+	}
+	return min(d, max)
+}
+
+// pauseWhileLeader waits d, and returns false as soon as r is no longer Leader.
+func pauseWhileLeader(r *raft.Raft, d time.Duration) bool {
+	for end := time.Now().Add(d); ; {
+		if r.State() != raft.Leader {
+			return false
+		}
+		left := time.Until(end)
+		if left <= 0 {
+			return true
+		}
+		time.Sleep(min(left, 20*time.Millisecond))
+	}
+}
 
 // watchLeadership steps down every time this node becomes Leader while its engine
 // is stopped: the stop hook fires once, but a stopped node is elected again
@@ -191,7 +265,14 @@ func (n *Node) watchLeadership(r *raft.Raft) {
 				return
 			}
 			if st == raft.Leader && n.eng.Fatal() != nil {
-				n.stepDown()
+				done := n.transfers.Load()
+				if done >= stepDownBudget {
+					n.log.Printf("walframe: stopped, Leader again, and out of leadership transfers (%d): waiting for a rebuild", done)
+					continue
+				}
+				if pauseWhileLeader(r, n.backoffBefore(done)) {
+					n.stepDown()
+				}
 			}
 		}
 	}()
@@ -200,42 +281,137 @@ func (n *Node) watchLeadership(r *raft.Raft) {
 // ensureBarrier runs this term's barrier if it has not run, under reqMu. The
 // context bounds the wait.
 func (n *Node) ensureBarrier(ctx context.Context) error {
-	term := n.raft.CurrentTerm()
-	if !n.needBarrier(term) {
+	if !n.needBarrier(n.raft.CurrentTerm()) {
 		return nil
 	}
 	if err := n.barrierFn(ctx); err != nil {
 		return fmt.Errorf("walframe: barrier: %w", err)
 	}
-	n.barrierTerm = term
 	return nil
 }
 
+// barrierRun is one barrier in flight.
+type barrierRun struct {
+	term uint64
+	done chan struct{}
+	err  error // read after done is closed
+}
+
+// barrierFn waits for this term's barrier, starting it if none is in flight.
+// The barrier runs in a goroutine of its own and is SHARED: a request whose
+// context ends first leaves it running, and the next request joins it instead
+// of appending another Barrier entry to the log. At most one is in flight, and
+// a failed one is forgotten so that the next request tries again.
 func (n *Node) barrierFn(ctx context.Context) error {
-	if n.barrier != nil {
-		return n.barrier()
+	term := n.raft.CurrentTerm()
+	n.bmu.Lock()
+	b := n.pending
+	if b == nil || b.term != term {
+		b = &barrierRun{term: term, done: make(chan struct{})}
+		n.pending = b
+		go n.runBarrier(b)
 	}
-	f := n.raft.Barrier(n.applyTimeout)
-	done := make(chan error, 1)
-	go func() { done <- f.Error() }()
+	n.bmu.Unlock()
 	select {
-	case err := <-done:
-		return err
+	case <-b.done:
+		return b.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-// Query runs read-only statements on this node's committed state. On the Leader
-// that state is first brought up to date, as for Execute: a new Leader's FSM may
-// not have applied the log yet.
+// runBarrier runs b to its end and records the outcome, whoever is waiting.
+func (n *Node) runBarrier(b *barrierRun) {
+	var err error
+	if n.barrier != nil {
+		err = n.barrier()
+	} else {
+		err = n.raft.Barrier(n.applyTimeout).Error()
+	}
+	n.bmu.Lock()
+	b.err = err
+	if err == nil && b.term > n.barrierTerm {
+		n.barrierTerm = b.term
+	}
+	if n.pending == b {
+		n.pending = nil
+	}
+	n.bmu.Unlock()
+	close(b.done)
+}
+
+// verifyLeader proves, by a round of heartbeats, that this node is still the
+// Leader of a quorum: what it read before this call cannot have been behind a
+// newer commit. The wait is bounded by ctx.
+func (n *Node) verifyLeader(ctx context.Context) error {
+	if n.raft == nil {
+		return ErrNotLeader
+	}
+	f := n.verify
+	if f == nil {
+		f = func() error { return n.raft.VerifyLeader().Error() }
+	}
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrNotLeader, err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Consistency is the guarantee a read asks for, after rqlite's read levels.
+type Consistency int
+
+const (
+	// Linearizable, the zero value and so the default: the read is served by the
+	// Leader, after its barrier of the term and a quorum check (VerifyLeader). It
+	// reflects every write acknowledged before it started. On any other node it
+	// is refused with ErrNotLeader.
+	Linearizable Consistency = iota
+	// Weak: served by the Leader after its barrier, with no quorum check. A
+	// Leader that has lost its quorum steps down by itself after
+	// LeaderLeaseTimeout, so a Weak read can be stale for that long and no
+	// longer. On any other node it is refused with ErrNotLeader.
+	Weak
+	// None: served from this node's local state, whatever its role. It can be
+	// arbitrarily stale (a follower is behind by its replication lag, a cut-off
+	// node by the length of the cut). The caller must opt in to that.
+	None
+)
+
+// Query runs read-only statements with Linearizable consistency. See QueryLevel.
 func (n *Node) Query(ctx context.Context, req *command.Request) ([]*command.QueryRows, error) {
+	return n.QueryLevel(ctx, req, Linearizable)
+}
+
+// QueryLevel runs read-only statements on this node's committed state at the
+// given consistency level. On the Leader (Weak and Linearizable) the state is
+// first brought up to date, as for Execute: a new Leader's FSM may not have
+// applied the log yet.
+func (n *Node) QueryLevel(ctx context.Context, req *command.Request, level Consistency) ([]*command.QueryRows, error) {
 	n.reqMu.Lock()
 	defer n.reqMu.Unlock()
-	if n.raft != nil && n.raft.State() == raft.Leader {
+	switch level {
+	case None:
+	case Weak, Linearizable:
+		if n.raft == nil || n.raft.State() != raft.Leader {
+			return nil, ErrNotLeader
+		}
 		if err := n.ensureBarrier(ctx); err != nil {
 			return nil, err
 		}
+		if level == Linearizable {
+			if err := n.verifyLeader(ctx); err != nil {
+				return nil, err
+			}
+		}
+	default:
+		return nil, fmt.Errorf("walframe: unknown consistency level %d", int(level))
 	}
 	return n.eng.Query(ctx, req, false)
 }
@@ -246,7 +422,12 @@ func (n *Node) Apply(l *raft.Log) any {
 		return nil
 	}
 	id, pl, err := unmarshalCommand(l.Data)
-	if err == nil {
+	if err != nil {
+		// The bytes decode the same way on every node, and nothing has been
+		// touched: that is a refusal, like a stale base, not a node that has lost
+		// track of its state. Stopping here would stop every node at once.
+		err = fmt.Errorf("%w: %v", ErrRejected, err)
+	} else {
 		err = n.eng.Commit(id, pl)
 	}
 	if err != nil {
@@ -295,6 +476,7 @@ func (n *Node) Restore(rc io.ReadCloser) error {
 		n.fatalMu.Lock()
 		n.fatal = nil
 		n.fatalMu.Unlock()
+		n.transfers.Store(0)
 	}
 	return err
 }

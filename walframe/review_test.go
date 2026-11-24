@@ -245,7 +245,7 @@ func TestReadPathIsReadOnly(t *testing.T) {
 			"BEGIN", "SAVEPOINT s", "PRAGMA query_only=1", "PRAGMA user_version=5",
 			"UPDATE sqlite_dbpage SET data=zeroblob(4096) WHERE pgno=1", "ATTACH '' AS x",
 		} {
-			rows, err := tn.n.Query(bg, req(s))
+			rows, err := tn.n.QueryLevel(bg, req(s), None)
 			if !refused(rows, err) {
 				t.Errorf("%s: %q was not refused", tn.id, s)
 			}

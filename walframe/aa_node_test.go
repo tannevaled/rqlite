@@ -142,10 +142,14 @@ func TestNodeApplyRefusals(t *testing.T) {
 	}
 	// A rejected entry is not fatal: the node still serves.
 	c.mustExec(req("INSERT INTO t VALUES(1)"))
-	// A garbage entry cannot be vouched for: the node stops.
-	if got := n.Apply(&raft.Log{Type: raft.LogCommand, Data: []byte("garbage")}); got == nil || n.Fatal() == nil {
+	// A garbage entry decodes the same way everywhere and changes nothing: it is
+	// refused (F-R4-4), as doc.go says, and the node keeps serving.
+	if got := n.Apply(&raft.Log{Type: raft.LogCommand, Data: []byte("garbage")}); !errors.Is(asErr(got), ErrRejected) || n.Fatal() != nil {
 		t.Fatalf("garbage entry: %v, %v", got, n.Fatal())
 	}
+	c.mustExec(req("INSERT INTO t VALUES(2)"))
+	// An apply that fails for any other reason stops the node.
+	n.eng.Fail(errInjected)
 	if _, err := n.Query(bg, req("SELECT 1")); err == nil {
 		t.Fatal("a stopped node served a read")
 	}

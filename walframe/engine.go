@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -319,8 +320,24 @@ func (e *Engine) Run(ctx context.Context, req *command.Request, xTime bool) ([]*
 	if err != nil {
 		return nil, nil, id, err
 	}
-	e.guard.Set(true)
-	res, rerr := conn.Request(ctx, req, xTime)
+	// Write mode refuses every ATTACH, and VACUUM needs one (a private database
+	// it copies into). Only the engine, having read the one word itself, selects
+	// the mode that lets that through; the SQL of a client cannot.
+	if isPlainVacuum(req) {
+		e.guard.SetVacuum(true)
+	} else {
+		e.guard.Set(true)
+	}
+	// The request holds the engine, and so the FSM and every read, for as long as
+	// it runs: bound it by the same timeout as a read, whatever the caller's own
+	// deadline is. A request cut short rolls back and is discarded below.
+	rctx := ctx
+	if e.queryTimeout > 0 {
+		var cancel context.CancelFunc
+		rctx, cancel = context.WithTimeout(ctx, e.queryTimeout)
+		defer cancel()
+	}
+	res, rerr := conn.Request(rctx, req, xTime)
 	e.guard.Set(false)
 	// A request that leaves a transaction open would hold frames back from the
 	// WAL and let the next request commit them.
@@ -335,6 +352,22 @@ func (e *Engine) Run(ctx context.Context, req *command.Request, xTime bool) ([]*
 		return res, nil, [idSize]byte{}, errors.Join(rerr, err)
 	}
 	return res, pl, id, rerr
+}
+
+// isPlainVacuum reports whether req is exactly one statement, the word VACUUM
+// (any case, spaces and one closing semicolon allowed) with no parameters. A
+// VACUUM with a schema or INTO, or among other statements, is not plain: it
+// runs in the ordinary write mode, which refuses the ATTACH it needs.
+func isPlainVacuum(req *command.Request) bool {
+	if len(req.GetStatements()) != 1 {
+		return false
+	}
+	st := req.Statements[0]
+	if len(st.GetParameters()) != 0 {
+		return false
+	}
+	s := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(st.GetSql()), ";"))
+	return strings.EqualFold(s, "VACUUM")
 }
 
 // collectLocked looks at what the request left in the WAL past the committed

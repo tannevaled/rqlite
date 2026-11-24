@@ -21,7 +21,7 @@ func TestGuardDenies(t *testing.T) {
 		deny bool
 	}{
 		{sqlite3.SQLITE_ATTACH, "other.db", true},
-		{sqlite3.SQLITE_ATTACH, "", false}, // VACUUM's private database
+		{sqlite3.SQLITE_ATTACH, "", true}, // only the engine's own VACUUM attaches ''
 		{sqlite3.SQLITE_DETACH, "", true},
 		{sqlite3.SQLITE_DETACH, "x", true},
 		{sqlite3.SQLITE_PRAGMA, "journal_mode", true},
@@ -71,12 +71,13 @@ func TestGuardDeniesReadMode(t *testing.T) {
 		{sqlite3.SQLITE_ATTACH, "", true},
 		{sqlite3.SQLITE_ANALYZE, "t", true},
 	} {
-		if got := guardDeniesMode(guardRead, c.op, c.z1, ""); got != c.deny {
+		if got := guardDeniesMode(guardRead, c.op, c.z1, "", ""); got != c.deny {
 			t.Errorf("read mode: guardDeniesMode(%d, %q) = %v", c.op, c.z1, got)
 		}
 	}
-	if !guardDeniesMode(guardWrite, sqlite3.SQLITE_CREATE_VTABLE, "v", "rtree") ||
-		guardDeniesMode(guardWrite, sqlite3.SQLITE_CREATE_VTABLE, "v", "FTS5") {
+	if !guardDeniesMode(guardWrite, sqlite3.SQLITE_CREATE_VTABLE, "v", "rtree", "main") ||
+		guardDeniesMode(guardWrite, sqlite3.SQLITE_CREATE_VTABLE, "v", "FTS5", "main") ||
+		!guardDeniesMode(guardWrite, sqlite3.SQLITE_CREATE_VTABLE, "v", "fts5", "temp") {
 		t.Error("virtual-table module allowlist")
 	}
 }
@@ -173,10 +174,10 @@ func TestDefensiveFailureRefusesTheConnection(t *testing.T) {
 func TestGuardDeniesTempAndForeignSchemas(t *testing.T) {
 	for _, op := range []int32{sqlite3.SQLITE_CREATE_TEMP_TABLE, sqlite3.SQLITE_CREATE_TEMP_INDEX,
 		sqlite3.SQLITE_CREATE_TEMP_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_VIEW} {
-		if !guardDeniesMode(guardWrite, op, "x", "") {
+		if !guardDeniesMode(guardWrite, op, "x", "", "main") {
 			t.Errorf("write mode allows temp op %d", op)
 		}
-		if guardDeniesMode(guardOff, op, "x", "") {
+		if guardDeniesMode(guardOff, op, "x", "", "main") {
 			t.Errorf("off mode refuses temp op %d", op)
 		}
 	}
@@ -195,15 +196,17 @@ func TestGuardDeniesTempAndForeignSchemas(t *testing.T) {
 		{guardWrite, sqlite3.SQLITE_CREATE_INDEX, "x", true},
 		{guardWrite, sqlite3.SQLITE_CREATE_TRIGGER, "x", true},
 		{guardWrite, sqlite3.SQLITE_CREATE_VIEW, "x", true},
-		{guardWrite, sqlite3.SQLITE_INSERT, "vacuum_db", false}, // VACUUM's copy
-		{guardWrite, sqlite3.SQLITE_INSERT, "vacuum_1a2b3c4d", false},
+		{guardWrite, sqlite3.SQLITE_INSERT, "vacuum_db", true}, // a name no client may use
+		{guardWrite, sqlite3.SQLITE_INSERT, "vacuum_1a2b3c4d", true},
+		{guardVacuum, sqlite3.SQLITE_INSERT, "vacuum_1a2b3c4d", false}, // VACUUM's copy, engine path only
+		{guardVacuum, sqlite3.SQLITE_INSERT, "temp", true},
 		{guardWrite, sqlite3.SQLITE_INSERT, "", false},
 		{guardWrite, sqlite3.SQLITE_SELECT, "x", false},
 		{guardOff, sqlite3.SQLITE_INSERT, "temp", false},
-		{guardRead, sqlite3.SQLITE_INSERT, "temp", false}, // read mode refuses it elsewhere
+		{guardRead, sqlite3.SQLITE_INSERT, "temp", true},
 	} {
-		if got := guardDeniesSchema(c.mode, c.op, c.z3); got != c.deny {
-			t.Errorf("guardDeniesSchema(%d, %d, %q) = %v", c.mode, c.op, c.z3, got)
+		if got := guardDeniesMode(c.mode, c.op, "t", "", c.z3); got != c.deny {
+			t.Errorf("guardDeniesMode(%d, %d, schema %q) = %v", c.mode, c.op, c.z3, got)
 		}
 	}
 }
@@ -242,22 +245,39 @@ func TestGuardRefusesTempAndAttachedPrivateWrites(t *testing.T) {
 		"CREATE TEMP TABLE a(x)", "CREATE TEMPORARY TABLE a(x)", "CREATE TEMP TABLE a AS SELECT 1",
 		"CREATE TEMP VIEW v AS SELECT 1", "CREATE TABLE temp.a(x)",
 		"CREATE TEMP TRIGGER g AFTER INSERT ON t BEGIN SELECT 1; END",
-		"ATTACH '' AS p; CREATE TABLE p.a(x)",
+		"ATTACH '' AS p; CREATE TABLE p.a(x)", "ATTACH '' AS p", "DETACH p", "PRAGMA temp.user_version=7",
+		"VACUUM INTO 'x'",
 	} {
-		if e := run(s); !strings.Contains(e, "not authorized") {
+		if e := run(s); !strings.Contains(e, "not authorized") && !strings.Contains(e, "authorization denied") {
 			t.Errorf("%q: %q", s, e)
 		}
 	}
-	for _, s := range []string{"INSERT INTO t VALUES(1)", "UPDATE t SET x=2", "VACUUM", "CREATE INDEX i ON t(x)", "DELETE FROM t"} {
+	for _, s := range []string{"INSERT INTO t VALUES(1)", "UPDATE t SET x=2", "CREATE INDEX i ON t(x)", "DELETE FROM t"} {
 		if e := run(s); e != "" {
 			t.Errorf("%q refused: %s", s, e)
+		}
+	}
+	// A client's VACUUM is refused in write mode (it attaches ''); the engine's
+	// own goes through the vacuum mode.
+	if e := run("VACUUM"); !strings.Contains(e, "authorization denied") {
+		t.Errorf("VACUUM in write mode: %q", e)
+	}
+	g.SetVacuum(true)
+	if e := run("VACUUM"); e != "" {
+		t.Errorf("VACUUM in vacuum mode refused: %s", e)
+	}
+	g.Set(true)
+	// An action code the allowlist does not name is refused, whatever it is.
+	for _, op := range []int32{34, 99, 1000} {
+		if !guardDeniesMode(guardWrite, op, "x", "", "main") || !guardDeniesMode(guardRead, op, "x", "", "main") {
+			t.Errorf("unknown action %d allowed", op)
 		}
 	}
 }
 
 func TestGuardOffRefusesNothing(t *testing.T) {
 	for _, op := range []int32{sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_CREATE_VTABLE} {
-		if guardDeniesMode(guardOff, op, "sqlite_dbpage", "rtree") {
+		if guardDeniesMode(guardOff, op, "sqlite_dbpage", "rtree", "temp") {
 			t.Errorf("off mode denies op %d", op)
 		}
 	}
@@ -323,11 +343,19 @@ func TestGuardOnARealConnection(t *testing.T) {
 			t.Errorf("guard on, %q: %q", s, e)
 		}
 	}
-	for _, s := range []string{"INSERT INTO t VALUES(1)", "SELECT * FROM t", "PRAGMA table_info(t)", "VACUUM"} {
+	for _, s := range []string{"INSERT INTO t VALUES(1)", "SELECT * FROM t", "PRAGMA table_info(t)"} {
 		if e := run(s); e != "" {
 			t.Errorf("guard on, %q refused: %s", s, e)
 		}
 	}
+	if e := run("VACUUM"); e == "" {
+		t.Error("guard on: a client VACUUM was allowed")
+	}
+	g.SetVacuum(true)
+	if e := run("VACUUM"); e != "" {
+		t.Errorf("vacuum mode, VACUUM refused: %s", e)
+	}
+	g.Set(true)
 	// DEFENSIVE and the authorizer both keep sqlite_dbpage read-only.
 	for _, s := range []string{"UPDATE sqlite_dbpage SET data=zeroblob(4096) WHERE pgno=1", "PRAGMA query_only=1", "PRAGMA foreign_keys=OFF"} {
 		if e := run(s); !strings.Contains(e, "not authorized") {
