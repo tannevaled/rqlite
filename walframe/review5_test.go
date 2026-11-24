@@ -391,17 +391,30 @@ func TestLevelAndStepDownGuards(t *testing.T) {
 	// No Raft: nothing is proved, nothing is read, and the hooks are not asked.
 	calls := 0
 	bare := &Node{eng: l.n.eng, behind: func() bool { return false }, verify: func() error { calls++; return nil }}
+	// A nil dereference is reported as a failed assertion, not a crash.
+	noPanic := func(what string, f func()) {
+		defer func() {
+			if p := recover(); p != nil {
+				t.Errorf("%s without raft panicked: %v", what, p)
+			}
+		}()
+		f()
+	}
 	for _, lv := range []Consistency{Weak, Linearizable} {
-		if rows, err := bare.QueryLevel(bg, req("SELECT 1"), lv); !errors.Is(err, ErrNotLeader) || rows != nil {
-			t.Errorf("no raft, level %d: %v %v", lv, rows, err)
+		noPanic("QueryLevel", func() {
+			if rows, err := bare.QueryLevel(bg, req("SELECT 1"), lv); !errors.Is(err, ErrNotLeader) || rows != nil {
+				t.Errorf("no raft, level %d: %v %v", lv, rows, err)
+			}
+		})
+	}
+	noPanic("verifyLeader", func() {
+		if err := bare.verifyLeader(bg); !errors.Is(err, ErrNotLeader) || calls != 0 {
+			t.Errorf("verifyLeader without raft: %v (hook called %d times)", err, calls)
 		}
-	}
-	if err := bare.verifyLeader(bg); !errors.Is(err, ErrNotLeader) || calls != 0 {
-		t.Errorf("verifyLeader without raft: %v (hook called %d times)", err, calls)
-	}
+	})
 	tcalls := 0
 	bare.transfer = func() error { tcalls++; return nil }
-	bare.stepDown()
+	noPanic("stepDown", bare.stepDown)
 	if tcalls != 0 {
 		t.Errorf("a node with no raft asked for a transfer")
 	}
