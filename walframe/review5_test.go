@@ -375,6 +375,64 @@ func TestAllNodesStoppedDoNotChurn(t *testing.T) {
 	}
 }
 
+// The guards of the new read and step-down paths, each held by an assertion.
+func TestLevelAndStepDownGuards(t *testing.T) {
+	c := newCluster(t, 3, 1<<30)
+	c.mustExec(req("CREATE TABLE t(x)"))
+	c.converge()
+	l := c.leader()
+	var f *tnode
+	for _, tn := range c.nodes {
+		if tn != l {
+			f = tn
+		}
+	}
+
+	// No Raft: nothing is proved, nothing is read, and the hooks are not asked.
+	calls := 0
+	bare := &Node{eng: l.n.eng, behind: func() bool { return false }, verify: func() error { calls++; return nil }}
+	for _, lv := range []Consistency{Weak, Linearizable} {
+		if rows, err := bare.QueryLevel(bg, req("SELECT 1"), lv); !errors.Is(err, ErrNotLeader) || rows != nil {
+			t.Errorf("no raft, level %d: %v %v", lv, rows, err)
+		}
+	}
+	if err := bare.verifyLeader(bg); !errors.Is(err, ErrNotLeader) || calls != 0 {
+		t.Errorf("verifyLeader without raft: %v (hook called %d times)", err, calls)
+	}
+	tcalls := 0
+	bare.transfer = func() error { tcalls++; return nil }
+	bare.stepDown()
+	if tcalls != 0 {
+		t.Errorf("a node with no raft asked for a transfer")
+	}
+
+	// A Leader whose quorum proof fails refuses a Linearizable read, and a Weak
+	// one does not ask for the proof.
+	asked := 0
+	l.n.verify = func() error { asked++; return errInjected }
+	if rows, err := l.n.QueryLevel(bg, req("SELECT 1"), Linearizable); !errors.Is(err, ErrNotLeader) || rows != nil {
+		t.Errorf("linearizable with a failed proof: %v %v", rows, err)
+	}
+	if _, err := l.n.QueryLevel(bg, req("SELECT 1"), Weak); err != nil || asked != 1 {
+		t.Errorf("weak: %v (proof asked %d times)", err, asked)
+	}
+	l.n.verify = nil
+
+	// A follower never asks for a transfer, and its back-off wait ends at once.
+	f.n.transfer = func() error { tcalls++; return nil }
+	f.n.stepDown()
+	if tcalls != 0 {
+		t.Errorf("a follower asked for a transfer")
+	}
+	start := time.Now()
+	if pauseWhileLeader(f.r, 10*time.Second) || time.Since(start) > 2*time.Second {
+		t.Errorf("a follower waited out a leader's pause")
+	}
+	if !pauseWhileLeader(l.r, 30*time.Millisecond) {
+		t.Error("a Leader's pause was cut short")
+	}
+}
+
 func TestBackoffBefore(t *testing.T) {
 	n := &Node{backoff: 10 * time.Millisecond, backoffMax: 35 * time.Millisecond}
 	for _, c := range []struct {
