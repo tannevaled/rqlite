@@ -1,6 +1,7 @@
 package walframe
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -43,7 +44,7 @@ func TestIndexOnAShadowTableIsRefused(t *testing.T) {
 		if msg == "" {
 			t.Fatalf("%s was accepted; the rebuild below would overflow the stack", sql)
 		}
-		if !strings.Contains(strings.ToLower(msg), "authoriz") && !strings.Contains(msg, "shadow") &&!strings.Contains(strings.ToLower(msg), "denied") {
+		if !strings.Contains(strings.ToLower(msg), "authoriz") && !strings.Contains(msg, "shadow") && !strings.Contains(strings.ToLower(msg), "denied") {
 			t.Errorf("%s: refused for another reason: %s", sql, msg)
 		}
 	}
@@ -58,4 +59,42 @@ func TestIndexOnAShadowTableIsRefused(t *testing.T) {
 	if msg := run("CREATE INDEX ti ON t(a)"); msg != "" {
 		t.Errorf("index on an ordinary table: %s", msg)
 	}
+}
+
+// readSizes records the biggest slice ReadRange returned.
+type readSizes struct {
+	osOps
+	max int64
+}
+
+func (r *readSizes) ReadRange(p string, off, n int64) ([]byte, error) {
+	b, err := r.osOps.ReadRange(p, off, n)
+	if int64(len(b)) > r.max {
+		r.max = int64(len(b))
+	}
+	return b, err
+}
+
+// F-R5-2: a request that wrote far more than the entry bound is refused
+// without its whole WAL region being read into memory.
+func TestOversizedWriteIsRefusedWithoutReadingItAll(t *testing.T) {
+	defer nopanic(t)
+	a, _ := pair(t, 1<<40)
+	a.SetMaxEntryBytes(1 << 20)
+	rs := &readSizes{}
+	a.ops = rs
+	// about 24 MB of pages, 24 times the bound
+	sql := "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<24000) INSERT INTO t SELECT randomblob(1000) FROM c"
+	_, pl, _, err := a.Run(bg, req(sql), false)
+	if !errors.Is(err, ErrEntryTooLarge) || pl != nil {
+		t.Fatalf("Run: pl=%v err=%v", pl != nil, err)
+	}
+	if want := regionLimit(1<<20, int64(a.tl.pageSize)); rs.max > want {
+		t.Errorf("read %d bytes of WAL at once, the limit is %d", rs.max, want)
+	}
+	if rs.max > 4<<20 {
+		t.Errorf("read %d bytes at once for a 1 MiB bound", rs.max)
+	}
+	// The engine goes on.
+	runOK(t, a, "INSERT INTO t VALUES(1)")
 }

@@ -406,7 +406,17 @@ func (e *Engine) collectLocked() (*PageList, [idSize]byte, error) {
 		}
 		var region []byte
 		if err == nil {
-			region, err = e.ops.ReadRange(e.walPath, e.tl.end, -1)
+			// Never read past what could still be shipped: the entry bound
+			// refuses a larger region anyway, and a request that wrote
+			// hundreds of megabytes must not be read whole to learn that.
+			limit := int64(-1)
+			if e.maxEntry > 0 {
+				limit = regionLimit(e.maxEntry, int64(e.tl.pageSize))
+			}
+			region, err = e.ops.ReadRange(e.walPath, e.tl.end, limit)
+			if err == nil && limit >= 0 && int64(len(region)) >= limit {
+				return nil, id, e.discardLocked(fmt.Errorf("%w: more than %d bytes of WAL, the bound is %d", ErrEntryTooLarge, limit, e.maxEntry))
+			}
 		}
 		if err != nil {
 			return nil, id, e.discardLocked(err)
@@ -429,6 +439,17 @@ func (e *Engine) collectLocked() (*PageList, [idSize]byte, error) {
 	e.pend = &pending{id: id, end: commitEnd, tail: endTail}
 	return &PageList{PageSize: ps, BaseSeq: e.seq, BaseHash: e.head,
 		Txs: extractTxsAt(buf, base, frames, int64(ps), from, commitEnd)}, id, nil
+}
+
+// regionLimit is the number of WAL bytes past the committed end that collectLocked
+// reads at most: one frame more than the entry bound allows, since a frame of
+// pageSize bytes costs pageSize+4 in the entry and pageSize+24 in the WAL. A
+// region that fills it holds too many frames to be shipped.
+func regionLimit(maxEntry, pageSize int64) int64 {
+	if pageSize <= 0 {
+		pageSize = 512 // the smallest: the most frames per byte
+	}
+	return (maxEntry/(pageSize+4)+2)*(pageSize+24) + walHeaderSize
 }
 
 // walHeaderIs reports whether hdr is the header of the WAL tail t belongs to.
