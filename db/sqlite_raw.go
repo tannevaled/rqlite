@@ -78,13 +78,23 @@ func cFuncPointer[T any](f T) uintptr {
 
 // dbConfigNoCkptOnClose stops the connection checkpointing the WAL on close.
 func (r rawConn) dbConfigNoCkptOnClose() error {
+	return r.dbConfigOn(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+}
+
+// dbConfigDefensive turns on SQLITE_DBCONFIG_DEFENSIVE: no write to
+// sqlite_dbpage, no writable_schema, no shadow-table writes.
+func (r rawConn) dbConfigDefensive() error {
+	return r.dbConfigOn(sqlite3.SQLITE_DBCONFIG_DEFENSIVE)
+}
+
+func (r rawConn) dbConfigOn(op int32) error {
 	const vaSlot = 8
 	bp := libc.Xmalloc(r.tls, types.Size_t(2*vaSlot))
 	if bp == 0 {
 		return r.errstr(sqlite3.SQLITE_NOMEM)
 	}
 	defer libc.Xfree(r.tls, bp)
-	rc := sqlite3.Xsqlite3_db_config(r.tls, r.db, sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+	rc := sqlite3.Xsqlite3_db_config(r.tls, r.db, op,
 		libc.VaList(bp, int32(1), uintptr(0)))
 	if rc != sqlite3.SQLITE_OK {
 		return r.errstr(rc)
