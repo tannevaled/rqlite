@@ -174,7 +174,46 @@ func guardDeniesWrite(vacuum bool, op int32, z1, z2, z3 string) bool {
 			return true
 		}
 	}
+	switch op {
+	case sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TRIGGER:
+		// Both take the target table as z2. SQLite's defensive mode refuses a
+		// write to a shadow table but not an index or a trigger on one, and an
+		// index on an fts5 shadow table makes 'rebuild' recurse without bound.
+		// An index SQLite names itself (a PRIMARY KEY or UNIQUE of the table
+		// definition, which is how the module creates its own shadow tables)
+		// is not a client's: a client cannot create a name with that prefix.
+		if op == sqlite3.SQLITE_CREATE_INDEX && strings.HasPrefix(strings.ToLower(z1), "sqlite_autoindex_") {
+			break
+		}
+		if isShadowName(z2) {
+			return true
+		}
+	case sqlite3.SQLITE_REINDEX:
+		if isShadowName(z1) {
+			return true
+		}
+	}
 	return deniedSchema(vacuum, z3)
+}
+
+// shadowSuffixes end the names of the shadow tables of fts3/4/5 and rtree.
+// SQLite does not tell the authorizer which tables are shadows, so the guard
+// matches the name: deny by default. The cost is that a user's own table with
+// such a name cannot be indexed or given a trigger.
+var shadowSuffixes = []string{
+	"_data", "_idx", "_config", "_content", "_docsize", "_stat", "_segments", "_segdir",
+	"_node", "_rowid", "_parent",
+}
+
+// isShadowName reports whether a table name looks like a shadow table's.
+func isShadowName(name string) bool {
+	n := strings.ToLower(name)
+	for _, s := range shadowSuffixes {
+		if strings.HasSuffix(n, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // deniedSchema reports whether a write to schema s is refused: only "main" is
