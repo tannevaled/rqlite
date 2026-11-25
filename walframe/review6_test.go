@@ -98,3 +98,22 @@ func TestOversizedWriteIsRefusedWithoutReadingItAll(t *testing.T) {
 	// The engine goes on.
 	runOK(t, a, "INSERT INTO t VALUES(1)")
 }
+
+// F-R5-3: the results that come back WITH an error are still reads, and are
+// not shown to the client unless leadership is proved.
+func TestExecuteErrorPathVerifiesLeadership(t *testing.T) {
+	c := newCluster(t, 1, 1<<30)
+	l := c.leader().n
+	c.mustExec(req("CREATE TABLE t(x)"))
+	called := 0
+	l.verify = func() error { called++; return errInjected }
+	res, err := l.Execute(bg, req("BEGIN", "SELECT count(*) FROM t"))
+	if called != 1 || res != nil || !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("a read with an error, leadership not proved: %v %v (verify called %d times)", res, err, called)
+	}
+	l.verify = func() error { called++; return nil }
+	res, err = l.Execute(bg, req("BEGIN", "SELECT count(*) FROM t"))
+	if err == nil || len(res) == 0 {
+		t.Errorf("proved: the error and the rows should both come back: %v %v", res, err)
+	}
+}

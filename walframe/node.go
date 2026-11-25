@@ -126,7 +126,9 @@ func (n *Node) Execute(ctx context.Context, req *command.Request) ([]*command.Ex
 		// Nothing to replicate: the request may still have READ, and what it read
 		// is only as good as this node's leadership. Prove it, as a linearizable
 		// Query does, before the client sees it.
-		if err == nil && len(res) > 0 {
+		// An error does not change that: the results that came back with it
+		// are read just the same.
+		if len(res) > 0 {
 			if verr := n.verifyLeader(ctx); verr != nil {
 				return nil, verr
 			}
