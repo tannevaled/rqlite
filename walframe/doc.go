@@ -81,7 +81,18 @@
 // the engine is ErrStopped) until Restore installs a snapshot. A stopped Leader
 // hands the leadership over, at most stepDownBudget times (with a growing pause
 // between handovers) until a Restore: a cluster whose nodes all stopped waits
-// for an operator and does not elect in a loop. Snapshots are
+// for an operator and does not elect in a loop.
+//
+// A stopped node that is still Leader once the budget is spent refuses every
+// write although the other nodes are healthy: an availability cost, reached
+// only by an engine-fatal apply failure (a disk error, corruption), never by a
+// client statement. It is kept on purpose. Leaving the voter set (RemoveServer,
+// or DemoteVoter) is a configuration change that shrinks the quorum, so a
+// bug that stops nodes one after another would shrink the cluster to a single
+// voter, and nothing would put the node back after its Restore; shutting the
+// Raft down loses the node's log and snapshots on the same condition. The
+// operator's remedy is a Restore on the stopped node, or removing it from the
+// cluster. Snapshots are
 // validated before anything is installed: checksum, SQLite header, WAL scan,
 // and integrity_check on a scratch copy.
 //
